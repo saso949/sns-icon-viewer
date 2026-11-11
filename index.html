@@ -28,7 +28,7 @@
       <section class="panel-section">
         <div class="section-header">
           <h2>1. アイコン候補を追加</h2>
-          <span class="badge-hint">自動軽量化・複数対応</span>
+          <span class="badge-hint">元画像全体から位置調整可</span>
         </div>
         <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="画像をドラッグ＆ドロップ、またはタップして選択">
           <input type="file" id="file-input" accept="image/*" multiple hidden />
@@ -38,7 +38,7 @@
             <line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
           <p id="dropzone-title" class="dropzone-title">画像をタップして選択 / ドロップ</p>
-          <p id="dropzone-sub" class="dropzone-sub">高画質な写真も自動で軽量リサイズして読み込みます</p>
+          <p id="dropzone-sub" class="dropzone-sub">縦長・横長の写真もクロップせず全体を読み込みます</p>
         </div>
       </section>
 
@@ -51,11 +51,11 @@
             <button type="button" id="btn-clear-all" class="btn-text danger" title="すべてのアイコンをクリア">全削除</button>
           </div>
         </div>
-        <p class="helper-note">タップで選択。歯車ボタンで位置・拡大率を調整できます。</p>
+        <p class="helper-note">各候補の「<strong>✂️ 位置調整</strong>」ボタンから、切り抜かれる前の元画像全体を動かして位置・拡大率を調整できます。</p>
         <div id="candidate-list" class="candidate-list"></div>
       </section>
 
-      <!-- プロフィール表示名・テキスト設定（スマホでは折りたたみ可能に） -->
+      <!-- プロフィール表示名・テキスト設定（スマホでは折りたたみ可能） -->
       <details class="panel-section profile-details" id="profile-details" open>
         <summary class="section-header summary-toggle">
           <h2>3. プレビュー用プロフィール設定</h2>
@@ -176,21 +176,21 @@
     </main>
   </div>
 
-  <!-- アイコン位置・拡大率調整モーダル -->
+  <!-- アイコン位置・拡大率調整モーダル（元画像全体を見ながら円形クロップ範囲を調整） -->
   <div id="crop-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="crop-modal-title">
     <div class="modal-card">
       <div class="modal-header">
-        <h3 id="crop-modal-title">アイコンの表示位置・拡大率の調整</h3>
+        <h3 id="crop-modal-title">✂️ アイコンの切り抜き位置・拡大率の調整</h3>
         <button type="button" id="btn-close-modal" class="btn-icon" aria-label="閉じる">&times;</button>
       </div>
       <div class="modal-body">
         <div class="crop-preview-row">
           <div class="crop-stage-wrap">
-            <div class="crop-stage" id="crop-stage" title="ドラッグして位置を移動できます">
-              <img id="crop-stage-img" src="" alt="プレビュー" draggable="false" />
-              <div class="crop-circle-guide"></div>
+            <!-- 元画像全体（円の外側の半透明領域も含む）を表示してドラッグ＆ピンチ操作できるCanvas -->
+            <div class="crop-canvas-container" id="crop-stage" title="ドラッグして画像全体の位置を自由に移動できます">
+              <canvas id="crop-stage-canvas" width="520" height="520"></canvas>
             </div>
-            <span class="crop-caption">128px (ドラッグで移動可)</span>
+            <span class="crop-caption">指やマウスで画像をドラッグして位置調整（円の外側も確認できます）</span>
           </div>
           <div class="crop-mini-previews">
             <div class="mini-preview-item">
@@ -214,8 +214,14 @@
             <input type="text" id="input-candidate-label" maxlength="24" />
           </div>
           <div class="slider-group">
-            <label for="slider-zoom">拡大率 (Zoom): <strong id="val-zoom">100%</strong></label>
-            <input type="range" id="slider-zoom" min="100" max="300" step="2" value="100" />
+            <div class="slider-label-row">
+              <label for="slider-zoom">拡大・縮小 (Zoom): <strong id="val-zoom">100%</strong></label>
+              <div class="zoom-preset-btns">
+                <button type="button" class="btn-tiny" id="btn-fit-whole" title="長辺も含めて画像全体が円の中に入る倍率にします">全体を入れる</button>
+                <button type="button" class="btn-tiny" id="btn-fit-cover" title="円の枠にちょうど収まる標準倍率(100%)にします">枠に合わせる(100%)</button>
+              </div>
+            </div>
+            <input type="range" id="slider-zoom" min="40" max="400" step="2" value="100" />
           </div>
           <div class="slider-group">
             <label for="slider-pan-x">左右位置 (X): <strong id="val-pan-x">0%</strong></label>
@@ -230,8 +236,8 @@
       <div class="modal-footer">
         <button type="button" id="btn-reset-crop" class="btn-secondary">位置をリセット</button>
         <div class="modal-footer-right">
-          <button type="button" id="btn-export-cropped" class="btn-secondary">切り抜きPNGを保存</button>
-          <button type="button" id="btn-save-crop" class="btn-primary">完了</button>
+          <button type="button" id="btn-export-cropped" class="btn-secondary">切り抜きPNG保存</button>
+          <button type="button" id="btn-save-crop" class="btn-primary">この位置で反映</button>
         </div>
       </div>
     </div>

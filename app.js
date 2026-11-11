@@ -1,20 +1,31 @@
 /**
  * SNS Icon Viewer - Main Application Logic
  * 複数候補のSNSアイコンを実際のSNS画面・各サイズ・各背景テーマに埋め込んで識別性を比較するアプリ
- * (スマホでの高解像度写真の複数枚同時読み込みでもクラッシュしない省メモリ・逐次リサイズ設計)
+ * - 元画像はアスペクト比を維持したままクロップせずに軽量保持 (最大768px)
+ * - 位置調整モーダルでは「切り抜かれる前の元画像全体（円の枠外も含む）」を見ながら自由自在にドラッグ・拡縮可能
  */
 
 (function () {
   "use strict";
 
-  // Preview max resolution (128px * 3x Retina = 384px is plenty sharp and uses < 0.5MB RAM per image)
-  const MAX_ICON_RESOLUTION = 384;
+  // Max dimension for uncropped source image (keeps full aspect ratio & plenty of detail for zooming up to 400%)
+  const MAX_SOURCE_DIMENSION = 768;
+  // Resolution of cropped square avatar used across previews
+  const CROPPED_AVATAR_SIZE = 384;
 
   // =========================================================================
   // State
   // =========================================================================
   const state = {
-    candidates: [], // { id, name, dataUrl, isObjectUrl, zoom: 100, panX: 0, panY: 0, isSample: bool, diagnostics: {...} }
+    // Each candidate:
+    // {
+    //   id, name,
+    //   sourceUrl, isSourceObjectUrl, sourceW, sourceH,
+    //   dataUrl (cropped square url), isCroppedObjectUrl,
+    //   zoom: 100, panX: 0, panY: 0,
+    //   isSample: bool, diagnostics: {...}
+    // }
+    candidates: [],
     activeId: null,
     compareMode: "mix", // "mix" | "single" | "matrix"
     theme: "light", // "light" | "dim" | "dark"
@@ -31,6 +42,7 @@
         "新しいSNSアイコンどれがいいか迷ってます！タイムラインでパッと見て誰だか分かりやすいのはどれでしょう？🎨✨",
     },
     editingCandidateId: null,
+    editingSourceImg: null,
     isDrawerOpen: false,
   };
 
@@ -89,7 +101,7 @@
   const cropModal = document.getElementById("crop-modal");
   const btnCloseModal = document.getElementById("btn-close-modal");
   const cropStage = document.getElementById("crop-stage");
-  const cropStageImg = document.getElementById("crop-stage-img");
+  const cropStageCanvas = document.getElementById("crop-stage-canvas");
   const cropMini48 = document.getElementById("crop-mini-48");
   const cropMini32 = document.getElementById("crop-mini-32");
   const cropMini20 = document.getElementById("crop-mini-20");
@@ -100,11 +112,12 @@
   const valZoom = document.getElementById("val-zoom");
   const valPanX = document.getElementById("val-pan-x");
   const valPanY = document.getElementById("val-pan-y");
+  const btnFitWhole = document.getElementById("btn-fit-whole");
+  const btnFitCover = document.getElementById("btn-fit-cover");
   const btnResetCrop = document.getElementById("btn-reset-crop");
   const btnExportCropped = document.getElementById("btn-export-cropped");
   const btnSaveCrop = document.getElementById("btn-save-crop");
 
-  // Collapse profile details by default on mobile so preview is closer to top
   if (window.innerWidth <= 768 && profileDetails) {
     profileDetails.removeAttribute("open");
   }
@@ -112,8 +125,14 @@
   // =========================================================================
   // Memory Cleanup Helper
   // =========================================================================
-  function revokeCandidateUrl(candidate) {
-    if (candidate && candidate.isObjectUrl && candidate.dataUrl) {
+  function revokeCandidateUrls(candidate) {
+    if (!candidate) return;
+    if (candidate.isSourceObjectUrl && candidate.sourceUrl) {
+      try {
+        URL.revokeObjectURL(candidate.sourceUrl);
+      } catch (_) {}
+    }
+    if (candidate.isCroppedObjectUrl && candidate.dataUrl) {
       try {
         URL.revokeObjectURL(candidate.dataUrl);
       } catch (_) {}
@@ -121,9 +140,52 @@
   }
 
   function clearAllCandidates() {
-    state.candidates.forEach(revokeCandidateUrl);
+    state.candidates.forEach(revokeCandidateUrls);
     state.candidates = [];
     state.activeId = null;
+  }
+
+  // =========================================================================
+  // Geometry & Cropping Math (Shared by Crop Stage & Cropped Square Generator)
+  // =========================================================================
+  /**
+   * 円の直径 targetSize に対する画像の描画サイズ (drawW, drawH) と中心オフセット (offsetX, offsetY) を計算
+   * zoom=100% のとき、画像の短辺が targetSize に一致する（長辺はみ出し分は panX/panY で端まで移動可能）
+   */
+  function computeCropGeometry(sourceW, sourceH, targetSize, zoom, panX, panY) {
+    const aspect = (sourceW || 1) / (sourceH || 1);
+    const baseW = aspect >= 1 ? targetSize * aspect : targetSize;
+    const baseH = aspect >= 1 ? targetSize : targetSize / aspect;
+    const scale = (zoom || 100) / 100;
+    const drawW = baseW * scale;
+    const drawH = baseH * scale;
+    const offsetX = ((panX || 0) / 100) * (drawW / 2);
+    const offsetY = ((panY || 0) / 100) * (drawH / 2);
+    return { baseW, baseH, drawW, drawH, offsetX, offsetY };
+  }
+
+  /**
+   * 元画像 sourceImgOrCanvas から (zoom, panX, panY) に基づいて正方形クロップ済み Canvas を生成する
+   */
+  function createCroppedCanvas(sourceImgOrCanvas, sourceW, sourceH, outSize, zoom, panX, panY) {
+    const canvas = document.createElement("canvas");
+    canvas.width = outSize;
+    canvas.height = outSize;
+    const ctx = canvas.getContext("2d");
+
+    const { drawW, drawH, offsetX, offsetY } = computeCropGeometry(
+      sourceW,
+      sourceH,
+      outSize,
+      zoom,
+      panX,
+      panY
+    );
+
+    const x = outSize / 2 - drawW / 2 + offsetX;
+    const y = outSize / 2 - drawH / 2 + offsetY;
+    ctx.drawImage(sourceImgOrCanvas, x, y, drawW, drawH);
+    return canvas;
   }
 
   // =========================================================================
@@ -147,48 +209,54 @@
   function generateSampleCandidates() {
     const samples = [];
 
-    // Sample A: Closeup character with warm vivid background (High legibility)
+    // Sample A: Closeup character (Portrait 3:4 aspect ratio so user can also test vertical panning!)
     {
       const c = document.createElement("canvas");
       c.width = 256;
-      c.height = 256;
+      c.height = 340;
       const ctx = c.getContext("2d");
-      const grad = ctx.createLinearGradient(0, 0, 256, 256);
+      const grad = ctx.createLinearGradient(0, 0, 256, 340);
       grad.addColorStop(0, "#ffedd5");
       grad.addColorStop(1, "#fdba74");
       ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, 256, 256);
+      ctx.fillRect(0, 0, 256, 340);
 
+      // Torso/Shoulders extending down
       ctx.fillStyle = "#1e293b";
       ctx.beginPath();
-      ctx.arc(128, 255, 85, Math.PI, 0, false);
+      ctx.arc(128, 320, 105, Math.PI, 0, false);
       ctx.fill();
 
+      // Hair back
       ctx.fillStyle = "#334155";
       ctx.beginPath();
-      ctx.arc(128, 114, 68, 0, Math.PI * 2);
+      ctx.arc(128, 150, 68, 0, Math.PI * 2);
       ctx.fill();
 
+      // Face
       ctx.fillStyle = "#fff1e6";
       ctx.beginPath();
-      ctx.arc(128, 122, 50, 0, Math.PI * 2);
+      ctx.arc(128, 158, 50, 0, Math.PI * 2);
       ctx.fill();
 
+      // Eyes
       ctx.fillStyle = "#0f172a";
       ctx.beginPath();
-      ctx.arc(109, 120, 7, 0, Math.PI * 2);
-      ctx.arc(147, 120, 7, 0, Math.PI * 2);
+      ctx.arc(109, 156, 7, 0, Math.PI * 2);
+      ctx.arc(147, 156, 7, 0, Math.PI * 2);
       ctx.fill();
 
+      // Smile
       ctx.strokeStyle = "#e11d48";
       ctx.lineWidth = 4;
       ctx.beginPath();
-      ctx.arc(128, 132, 14, 0.15 * Math.PI, 0.85 * Math.PI);
+      ctx.arc(128, 168, 14, 0.15 * Math.PI, 0.85 * Math.PI);
       ctx.stroke();
 
+      // Bangs
       ctx.fillStyle = "#1e293b";
       ctx.beginPath();
-      ctx.arc(128, 100, 54, Math.PI, 0, false);
+      ctx.arc(128, 136, 54, Math.PI, 0, false);
       ctx.fill();
 
       samples.push({
@@ -197,31 +265,32 @@
       });
     }
 
-    // Sample B: Full body zoomed out (Harder to identify when small)
+    // Sample B: Full body zoomed out (Portrait 3:4)
     {
       const c = document.createElement("canvas");
       c.width = 256;
-      c.height = 256;
+      c.height = 340;
       const ctx = c.getContext("2d");
-      const grad = ctx.createLinearGradient(0, 0, 0, 256);
+      const grad = ctx.createLinearGradient(0, 0, 0, 340);
       grad.addColorStop(0, "#93c5fd");
-      grad.addColorStop(0.7, "#e0f2fe");
-      grad.addColorStop(0.71, "#86efac");
+      grad.addColorStop(0.68, "#e0f2fe");
+      grad.addColorStop(0.69, "#86efac");
       grad.addColorStop(1, "#4ade80");
       ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, 256, 256);
+      ctx.fillRect(0, 0, 256, 340);
 
+      // Full body character
       ctx.fillStyle = "#1e293b";
-      ctx.fillRect(118, 120, 20, 52);
-      ctx.fillRect(118, 172, 8, 35);
-      ctx.fillRect(130, 172, 8, 35);
+      ctx.fillRect(116, 155, 24, 65);
+      ctx.fillRect(116, 220, 10, 48);
+      ctx.fillRect(130, 220, 10, 48);
       ctx.fillStyle = "#fde68a";
       ctx.beginPath();
-      ctx.arc(128, 100, 16, 0, Math.PI * 2);
+      ctx.arc(128, 130, 20, 0, Math.PI * 2);
       ctx.fill();
 
       samples.push({
-        name: "案B: 全身引き(縮小注意)",
+        name: "案B: 全身引き(位置調整可)",
         canvas: c,
       });
     }
@@ -296,16 +365,16 @@
   }
 
   // =========================================================================
-  // Image Diagnostics (Computed directly from Canvas without extra Image decode)
+  // Image Diagnostics (Computed from the cropped square canvas)
   // =========================================================================
-  function analyzeSourceCanvas(sourceCanvas) {
+  function analyzeCroppedCanvas(croppedCanvas) {
     try {
       const size = 64;
       const c = document.createElement("canvas");
       c.width = size;
       c.height = size;
       const ctx = c.getContext("2d");
-      ctx.drawImage(sourceCanvas, 0, 0, size, size);
+      ctx.drawImage(croppedCanvas, 0, 0, size, size);
       const data = ctx.getImageData(0, 0, size, size).data;
 
       let edgeLumSum = 0;
@@ -335,6 +404,9 @@
         }
       }
 
+      c.width = 1;
+      c.height = 1;
+
       const avgEdgeLum = edgeCount > 0 ? edgeLumSum / edgeCount : 128;
       const meanLum =
         lumValues.reduce((acc, v) => acc + v, 0) / (lumValues.length || 1);
@@ -363,7 +435,7 @@
   }
 
   // =========================================================================
-  // Memory-Safe Image Downscaling & ObjectURL Creation
+  // Memory-Safe Image Downscaling & ObjectURL Creation (Preserves Full Aspect Ratio!)
   // =========================================================================
   function canvasToOptimizedUrl(canvas) {
     return new Promise((resolve) => {
@@ -374,17 +446,17 @@
               resolve({ url: URL.createObjectURL(blob), isObjectUrl: true });
             } else {
               resolve({
-                url: canvas.toDataURL("image/jpeg", 0.85),
+                url: canvas.toDataURL("image/png"),
                 isObjectUrl: false,
               });
             }
           },
           "image/webp",
-          0.88
+          0.9
         );
       } else {
         resolve({
-          url: canvas.toDataURL("image/jpeg", 0.85),
+          url: canvas.toDataURL("image/png"),
           isObjectUrl: false,
         });
       }
@@ -392,8 +464,8 @@
   }
 
   /**
-   * 1枚のFileを省メモリで読み込み、最大384px四方に縮小したBlob URLと診断結果を返す。
-   * 元の数MB〜十数MBのカメラ画像は即座にメモリ解放する。
+   * 1枚のFileを省メモリで読み込み、アスペクト比を維持したまま（一切クロップせず）最大768pxに軽量化した
+   * sourceUrl と、初期状態の正方形プレビュー用 croppedUrl を生成する。
    */
   function processSingleFile(file) {
     return new Promise((resolve) => {
@@ -405,29 +477,51 @@
           const origW = img.naturalWidth || img.width || 256;
           const origH = img.naturalHeight || img.height || 256;
 
-          // Center-crop square or keep aspect ratio inside MAX_ICON_RESOLUTION
-          const scale = Math.min(1, MAX_ICON_RESOLUTION / Math.max(origW, origH));
-          const targetW = Math.max(1, Math.round(origW * scale));
-          const targetH = Math.max(1, Math.round(origH * scale));
+          // Keep FULL image aspect ratio (no cropping!)
+          const scale = Math.min(1, MAX_SOURCE_DIMENSION / Math.max(origW, origH));
+          const sourceW = Math.max(1, Math.round(origW * scale));
+          const sourceH = Math.max(1, Math.round(origH * scale));
 
-          const canvas = document.createElement("canvas");
-          canvas.width = targetW;
-          canvas.height = targetH;
-          const ctx = canvas.getContext("2d");
-          ctx.drawImage(img, 0, 0, targetW, targetH);
+          const sourceCanvas = document.createElement("canvas");
+          sourceCanvas.width = sourceW;
+          sourceCanvas.height = sourceH;
+          const ctx = sourceCanvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, sourceW, sourceH);
 
-          // Free original full-resolution bitmap immediately!
+          // Free original full-resolution camera bitmap immediately
           URL.revokeObjectURL(tempRawUrl);
           img.src = "";
 
-          const diagnostics = analyzeSourceCanvas(canvas);
-          const { url, isObjectUrl } = await canvasToOptimizedUrl(canvas);
+          // Create initial cropped square canvas (zoom=100, panX=0, panY=0)
+          const croppedCanvas = createCroppedCanvas(
+            sourceCanvas,
+            sourceW,
+            sourceH,
+            CROPPED_AVATAR_SIZE,
+            100,
+            0,
+            0
+          );
+          const diagnostics = analyzeCroppedCanvas(croppedCanvas);
 
-          // Free temporary canvas memory on iOS Safari
-          canvas.width = 1;
-          canvas.height = 1;
+          const sourceObj = await canvasToOptimizedUrl(sourceCanvas);
+          const croppedObj = await canvasToOptimizedUrl(croppedCanvas);
 
-          resolve({ url, isObjectUrl, diagnostics });
+          // Release temporary canvases
+          sourceCanvas.width = 1;
+          sourceCanvas.height = 1;
+          croppedCanvas.width = 1;
+          croppedCanvas.height = 1;
+
+          resolve({
+            sourceUrl: sourceObj.url,
+            isSourceObjectUrl: sourceObj.isObjectUrl,
+            sourceW,
+            sourceH,
+            croppedUrl: croppedObj.url,
+            isCroppedObjectUrl: croppedObj.isObjectUrl,
+            diagnostics,
+          });
         } catch (err) {
           URL.revokeObjectURL(tempRawUrl);
           resolve(null);
@@ -452,20 +546,20 @@
     );
     if (files.length === 0) return;
 
-    // Remove built-in samples automatically when user uploads their first real images
     if (state.candidates.length > 0 && state.candidates.every((c) => c.isSample)) {
       clearAllCandidates();
     }
 
-    // Show progress state on dropzone so user knows files are being compressed safely
     const origTitle = dropzoneTitle.textContent;
     const origSub = dropzoneSub.textContent;
     dropzone.classList.add("loading");
 
+    const newlyAddedIds = [];
+
     try {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        dropzoneTitle.textContent = `画像を軽量化・読み込み中... (${i + 1} / ${files.length}枚)`;
+        dropzoneTitle.textContent = `画像を読み込み中... (${i + 1} / ${files.length}枚)`;
         dropzoneSub.textContent = file.name;
 
         const result = await processSingleFile(file);
@@ -477,8 +571,12 @@
           state.candidates.push({
             id,
             name: baseName.slice(0, 20) || `候補 ${state.candidates.length + 1}`,
-            dataUrl: result.url,
-            isObjectUrl: result.isObjectUrl,
+            sourceUrl: result.sourceUrl,
+            isSourceObjectUrl: result.isSourceObjectUrl,
+            sourceW: result.sourceW,
+            sourceH: result.sourceH,
+            dataUrl: result.croppedUrl,
+            isCroppedObjectUrl: result.isCroppedObjectUrl,
             zoom: 100,
             panX: 0,
             panY: 0,
@@ -486,9 +584,9 @@
             diagnostics: result.diagnostics,
           });
           state.activeId = id;
+          newlyAddedIds.push(id);
         }
 
-        // Yield to browser GC between photos so mobile Safari never spikes RAM
         await new Promise((r) => setTimeout(r, 25));
       }
     } finally {
@@ -497,8 +595,12 @@
       dropzoneSub.textContent = origSub;
     }
 
-    // Render DOM only ONCE after all files are processed!
     renderAll();
+
+    // If user uploaded 1 image, open the full-image crop/position modal right away so they can frame it!
+    if (newlyAddedIds.length === 1) {
+      openCropModal(newlyAddedIds[0]);
+    }
   }
 
   async function loadSamples() {
@@ -506,17 +608,37 @@
     const samples = generateSampleCandidates();
     for (let i = 0; i < samples.length; i++) {
       const s = samples[i];
-      const diagnostics = analyzeSourceCanvas(s.canvas);
-      const { url, isObjectUrl } = await canvasToOptimizedUrl(s.canvas);
+      const sourceW = s.canvas.width;
+      const sourceH = s.canvas.height;
+      const croppedCanvas = createCroppedCanvas(
+        s.canvas,
+        sourceW,
+        sourceH,
+        CROPPED_AVATAR_SIZE,
+        100,
+        0,
+        0
+      );
+      const diagnostics = analyzeCroppedCanvas(croppedCanvas);
+
+      const sourceObj = await canvasToOptimizedUrl(s.canvas);
+      const croppedObj = await canvasToOptimizedUrl(croppedCanvas);
+
       s.canvas.width = 1;
       s.canvas.height = 1;
+      croppedCanvas.width = 1;
+      croppedCanvas.height = 1;
 
       const id = "sample_" + i + "_" + Date.now();
       state.candidates.push({
         id,
         name: s.name,
-        dataUrl: url,
-        isObjectUrl,
+        sourceUrl: sourceObj.url,
+        isSourceObjectUrl: sourceObj.isObjectUrl,
+        sourceW,
+        sourceH,
+        dataUrl: croppedObj.url,
+        isCroppedObjectUrl: croppedObj.isObjectUrl,
         zoom: 100,
         panX: 0,
         panY: 0,
@@ -547,23 +669,15 @@
   }
 
   // =========================================================================
-  // Avatar HTML Builder (Applies per-candidate zoom & pan)
+  // Avatar HTML Builder (Uses exact cropped square `dataUrl`)
   // =========================================================================
   function renderAvatarFrame(candidate, sizeClass, extraClasses = "") {
     if (!candidate) {
       return `<div class="avatar-frame ${sizeClass} ${extraClasses}"></div>`;
     }
-    const scale = (candidate.zoom || 100) / 100;
-    const tx = candidate.panX || 0;
-    const ty = candidate.panY || 0;
-    const transformStyle =
-      scale !== 1 || tx !== 0 || ty !== 0
-        ? `style="transform: scale(${scale}) translate(${tx}%, ${ty}%);"`
-        : "";
-
     return `
       <div class="avatar-frame ${sizeClass} ${extraClasses}" data-candidate-id="${candidate.id}" title="${escapeHtml(candidate.name)}">
-        <img src="${candidate.dataUrl}" alt="${escapeHtml(candidate.name)}" decoding="async" ${transformStyle} />
+        <img src="${candidate.dataUrl}" alt="${escapeHtml(candidate.name)}" decoding="async" />
       </div>
     `;
   }
@@ -616,18 +730,14 @@
             <span class="candidate-index">${i + 1}</span>
             <div class="candidate-thumbs">
               ${renderAvatarFrame(c, "size-36")}
-              ${renderAvatarFrame(c, "size-20")}
             </div>
             <div class="candidate-info">
               <div class="candidate-name">${escapeHtml(c.name)}</div>
               <div class="candidate-badges">${diagHtml}</div>
             </div>
             <div class="candidate-actions">
-              <button type="button" class="btn-mini" data-crop-id="${c.id}" title="位置・拡大率を調整">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <circle cx="12" cy="12" r="3"></circle>
-                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                </svg>
+              <button type="button" class="btn-crop-action" data-crop-id="${c.id}" title="元画像全体から切り抜き位置・拡大率を調整">
+                ✂️ 位置調整
               </button>
               <button type="button" class="btn-mini delete" data-delete-id="${c.id}" title="削除">
                 &times;
@@ -638,9 +748,13 @@
       })
       .join("");
 
-    // Compact Quick Switcher inside top bar
+    const activeCand = getActiveCandidate();
+    const quickCropBtnHtml = activeCand
+      ? `<button type="button" class="quick-crop-btn" data-crop-id="${activeCand.id}" title="選択中アイコンの切り抜き位置を調整">✂️ 位置調整</button>`
+      : "";
+
     quickSwitcherBar.innerHTML =
-      `<span class="quick-switcher-label">候補切替:</span>` +
+      quickCropBtnHtml +
       state.candidates
         .map((c, idx) => {
           const isActive = c.id === state.activeId;
@@ -1167,15 +1281,11 @@
   function renderAll() {
     renderCandidateList();
 
-    // Theme attribute
     previewViewport.setAttribute("data-sns-theme", state.theme);
-
-    // Filter classes
     previewViewport.classList.toggle("filter-grayscale", state.filters.grayscale);
     previewViewport.classList.toggle("filter-blur", state.filters.blur);
     previewViewport.classList.toggle("filter-small-scale", state.filters.smallScale);
 
-    // Update mobile filter indicator dot if any filter/mode is changed from default
     const hasCustomSetting =
       state.filters.grayscale ||
       state.filters.blur ||
@@ -1186,7 +1296,6 @@
       activeFilterIndicator.classList.toggle("hidden", !hasCustomSetting);
     }
 
-    // Toggle Matrix vs Mockups
     if (state.compareMode === "matrix") {
       snsMockupsContainer.classList.add("hidden");
       matrixViewContainer.classList.remove("hidden");
@@ -1201,8 +1310,11 @@
   }
 
   // =========================================================================
-  // Crop / Position Adjustment Modal
+  // Crop / Position Adjustment Modal (Full Uncropped Image Stage!)
   // =========================================================================
+  const STAGE_SIZE = 520;
+  const CIRCLE_DIAMETER = 360;
+
   function openCropModal(candidateId) {
     const cand = state.candidates.find((c) => c.id === candidateId);
     if (!cand) return;
@@ -1213,16 +1325,20 @@
     sliderPanX.value = cand.panX || 0;
     sliderPanY.value = cand.panY || 0;
 
-    cropStageImg.src = cand.dataUrl;
-    cropMini48.src = cand.dataUrl;
-    cropMini32.src = cand.dataUrl;
-    cropMini20.src = cand.dataUrl;
-
-    updateCropModalPreview();
-    cropModal.classList.remove("hidden");
+    const img = new Image();
+    img.onload = () => {
+      state.editingSourceImg = img;
+      updateCropModalPreview();
+      cropModal.classList.remove("hidden");
+    };
+    img.src = cand.sourceUrl || cand.dataUrl;
   }
 
   function updateCropModalPreview() {
+    const cand = state.candidates.find((c) => c.id === state.editingCandidateId);
+    const img = state.editingSourceImg;
+    if (!cand || !img) return;
+
     const zoom = Number(sliderZoom.value);
     const panX = Number(sliderPanX.value);
     const panY = Number(sliderPanY.value);
@@ -1231,67 +1347,142 @@
     valPanX.textContent = `${panX}%`;
     valPanY.textContent = `${panY}%`;
 
-    const transform = `scale(${zoom / 100}) translate(${panX}%, ${panY}%)`;
-    cropStageImg.style.transform = transform;
-    cropMini48.style.transform = transform;
-    cropMini32.style.transform = transform;
-    cropMini20.style.transform = transform;
+    const sourceW = cand.sourceW || img.naturalWidth || img.width || 256;
+    const sourceH = cand.sourceH || img.naturalHeight || img.height || 256;
+
+    // 1. Draw the full uncropped image onto cropStageCanvas + circular mask overlay
+    const ctx = cropStageCanvas.getContext("2d");
+    ctx.clearRect(0, 0, STAGE_SIZE, STAGE_SIZE);
+
+    // Subtle checkerboard/dark background
+    ctx.fillStyle = "#090d16";
+    ctx.fillRect(0, 0, STAGE_SIZE, STAGE_SIZE);
+
+    const { drawW, drawH, offsetX, offsetY } = computeCropGeometry(
+      sourceW,
+      sourceH,
+      CIRCLE_DIAMETER,
+      zoom,
+      panX,
+      panY
+    );
+
+    const imgX = STAGE_SIZE / 2 - drawW / 2 + offsetX;
+    const imgY = STAGE_SIZE / 2 - drawH / 2 + offsetY;
+    ctx.drawImage(img, imgX, imgY, drawW, drawH);
+
+    // Draw semi-transparent dark mask OUTSIDE the circular crop area so user can see uncropped outer parts
+    ctx.save();
+    ctx.fillStyle = "rgba(9, 13, 22, 0.68)";
+    ctx.beginPath();
+    ctx.rect(0, 0, STAGE_SIZE, STAGE_SIZE);
+    ctx.arc(STAGE_SIZE / 2, STAGE_SIZE / 2, CIRCLE_DIAMETER / 2, 0, Math.PI * 2, true);
+    ctx.fill();
+
+    // Draw subtle rule-of-thirds grid inside circle
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.18)";
+    ctx.lineWidth = 1;
+    const r = CIRCLE_DIAMETER / 2;
+    const cx = STAGE_SIZE / 2;
+    const cy = STAGE_SIZE / 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.clip();
+
+    for (const frac of [-1 / 3, 1 / 3]) {
+      ctx.beginPath();
+      ctx.moveTo(cx + r * frac, cy - r);
+      ctx.lineTo(cx + r * frac, cy + r);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(cx - r, cy + r * frac);
+      ctx.lineTo(cx + r, cy + r * frac);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // Draw bright circle border ring
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(STAGE_SIZE / 2, STAGE_SIZE / 2, CIRCLE_DIAMETER / 2, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // 2. Update live mini previews (48px, 32px, 20px)
+    const miniCanvas = createCroppedCanvas(img, sourceW, sourceH, 96, zoom, panX, panY);
+    const miniDataUrl = miniCanvas.toDataURL("image/jpeg", 0.88);
+    cropMini48.src = miniDataUrl;
+    cropMini32.src = miniDataUrl;
+    cropMini20.src = miniDataUrl;
+    miniCanvas.width = 1;
+    miniCanvas.height = 1;
   }
 
-  function saveCropModal() {
+  async function saveCropModal() {
     const cand = state.candidates.find((c) => c.id === state.editingCandidateId);
-    if (cand) {
+    const img = state.editingSourceImg;
+    if (cand && img) {
       cand.name = inputCandidateLabel.value.trim() || cand.name;
       cand.zoom = Number(sliderZoom.value);
       cand.panX = Number(sliderPanX.value);
       cand.panY = Number(sliderPanY.value);
+
+      const sourceW = cand.sourceW || img.naturalWidth || img.width || 256;
+      const sourceH = cand.sourceH || img.naturalHeight || img.height || 256;
+
+      const croppedCanvas = createCroppedCanvas(
+        img,
+        sourceW,
+        sourceH,
+        CROPPED_AVATAR_SIZE,
+        cand.zoom,
+        cand.panX,
+        cand.panY
+      );
+      const diagnostics = analyzeCroppedCanvas(croppedCanvas);
+      const croppedObj = await canvasToOptimizedUrl(croppedCanvas);
+      croppedCanvas.width = 1;
+      croppedCanvas.height = 1;
+
+      if (cand.isCroppedObjectUrl && cand.dataUrl) {
+        try {
+          URL.revokeObjectURL(cand.dataUrl);
+        } catch (_) {}
+      }
+
+      cand.dataUrl = croppedObj.url;
+      cand.isCroppedObjectUrl = croppedObj.isObjectUrl;
+      cand.diagnostics = diagnostics;
     }
+
     cropModal.classList.add("hidden");
     state.editingCandidateId = null;
+    state.editingSourceImg = null;
     renderAll();
   }
 
   function exportCroppedPng() {
     const cand = state.candidates.find((c) => c.id === state.editingCandidateId);
-    if (!cand) return;
+    const img = state.editingSourceImg;
+    if (!cand || !img) return;
 
-    const img = new Image();
-    img.onload = () => {
-      const outSize = 512;
-      const canvas = document.createElement("canvas");
-      canvas.width = outSize;
-      canvas.height = outSize;
-      const ctx = canvas.getContext("2d");
+    const sourceW = cand.sourceW || img.naturalWidth || img.width || 256;
+    const sourceH = cand.sourceH || img.naturalHeight || img.height || 256;
+    const zoom = Number(sliderZoom.value);
+    const panX = Number(sliderPanX.value);
+    const panY = Number(sliderPanY.value);
 
-      const zoom = Number(sliderZoom.value) / 100;
-      const panX = Number(sliderPanX.value) / 100;
-      const panY = Number(sliderPanY.value) / 100;
-
-      const imgAspect = img.width / img.height;
-      let drawW = outSize;
-      let drawH = outSize;
-      if (imgAspect > 1) {
-        drawW = outSize * imgAspect;
-      } else {
-        drawH = outSize / imgAspect;
-      }
-
-      ctx.save();
-      ctx.translate(outSize / 2, outSize / 2);
-      ctx.scale(zoom, zoom);
-      ctx.translate(panX * outSize, panY * outSize);
-      ctx.drawImage(img, -drawW / 2, -drawH / 2, drawW, drawH);
-      ctx.restore();
-
-      const link = document.createElement("a");
-      link.download = `${cand.name || "sns_icon"}_512x512.png`;
-      link.href = canvas.toDataURL("image/png");
-      link.click();
-    };
-    img.src = cand.dataUrl;
+    const outCanvas = createCroppedCanvas(img, sourceW, sourceH, 512, zoom, panX, panY);
+    const link = document.createElement("a");
+    link.download = `${cand.name || "sns_icon"}_512x512.png`;
+    link.href = outCanvas.toDataURL("image/png");
+    link.click();
+    outCanvas.width = 1;
+    outCanvas.height = 1;
   }
 
-  // Dragging inside cropStage
+  // Dragging & Wheel Zooming inside cropStage (1:1 pixel-accurate tracking)
   let isDraggingCrop = false;
   let dragStartX = 0;
   let dragStartY = 0;
@@ -1309,17 +1500,81 @@
 
   cropStage.addEventListener("pointermove", (e) => {
     if (!isDraggingCrop) return;
-    const dx = e.clientX - dragStartX;
-    const dy = e.clientY - dragStartY;
+    const cand = state.candidates.find((c) => c.id === state.editingCandidateId);
+    const img = state.editingSourceImg;
+    if (!cand || !img) return;
+
+    const rect = cropStage.getBoundingClientRect();
+    const scaleToCanvas = STAGE_SIZE / (rect.width || 240);
+    const dxCanvas = (e.clientX - dragStartX) * scaleToCanvas;
+    const dyCanvas = (e.clientY - dragStartY) * scaleToCanvas;
+
+    const sourceW = cand.sourceW || img.naturalWidth || 256;
+    const sourceH = cand.sourceH || img.naturalHeight || 256;
+    const zoom = Number(sliderZoom.value);
+
+    const { drawW, drawH } = computeCropGeometry(
+      sourceW,
+      sourceH,
+      CIRCLE_DIAMETER,
+      zoom,
+      0,
+      0
+    );
+
+    const deltaPanX = (dxCanvas / (drawW / 2)) * 100;
+    const deltaPanY = (dyCanvas / (drawH / 2)) * 100;
+
     const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
-    sliderPanX.value = clamp(Math.round(startPanX + dx * 0.7), -100, 100);
-    sliderPanY.value = clamp(Math.round(startPanY + dy * 0.7), -100, 100);
+    sliderPanX.value = clamp(Math.round(startPanX + deltaPanX), -100, 100);
+    sliderPanY.value = clamp(Math.round(startPanY + deltaPanY), -100, 100);
     updateCropModalPreview();
   });
 
   cropStage.addEventListener("pointerup", () => {
     isDraggingCrop = false;
   });
+
+  // Mouse wheel zoom on cropStage
+  cropStage.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      const currentZoom = Number(sliderZoom.value);
+      const delta = e.deltaY < 0 ? 8 : -8;
+      const nextZoom = Math.max(40, Math.min(400, currentZoom + delta));
+      sliderZoom.value = nextZoom;
+      updateCropModalPreview();
+    },
+    { passive: false }
+  );
+
+  // Preset buttons: "全体を入れる" (fit longest side inside circle) & "枠に合わせる(100%)"
+  if (btnFitWhole) {
+    btnFitWhole.addEventListener("click", () => {
+      const cand = state.candidates.find((c) => c.id === state.editingCandidateId);
+      const img = state.editingSourceImg;
+      if (!cand || !img) return;
+      const sourceW = cand.sourceW || img.naturalWidth || 256;
+      const sourceH = cand.sourceH || img.naturalHeight || 256;
+      const ratio =
+        Math.min(sourceW, sourceH) / Math.max(sourceW, sourceH);
+      const fitZoom = Math.max(40, Math.round(ratio * 100));
+      sliderZoom.value = fitZoom;
+      sliderPanX.value = 0;
+      sliderPanY.value = 0;
+      updateCropModalPreview();
+    });
+  }
+
+  if (btnFitCover) {
+    btnFitCover.addEventListener("click", () => {
+      sliderZoom.value = 100;
+      sliderPanX.value = 0;
+      sliderPanY.value = 0;
+      updateCropModalPreview();
+    });
+  }
 
   // =========================================================================
   // Event Listeners
@@ -1399,7 +1654,7 @@
       e.stopPropagation();
       const id = delBtn.getAttribute("data-delete-id");
       const target = state.candidates.find((c) => c.id === id);
-      revokeCandidateUrl(target);
+      revokeCandidateUrls(target);
       state.candidates = state.candidates.filter((c) => c.id !== id);
       if (state.activeId === id) {
         state.activeId = state.candidates[0]?.id || null;
@@ -1517,6 +1772,7 @@
   btnCloseModal.addEventListener("click", () => {
     cropModal.classList.add("hidden");
     state.editingCandidateId = null;
+    state.editingSourceImg = null;
   });
   btnSaveCrop.addEventListener("click", saveCropModal);
   btnExportCropped.addEventListener("click", exportCroppedPng);
