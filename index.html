@@ -13,7 +13,7 @@
     <aside class="sidebar">
       <div class="brand-header">
         <div class="brand-logo" aria-hidden="true">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="8" r="4"></circle>
             <path d="M4 20c1.5-4 4.5-6 8-6s6.5 2 8 6"></path>
           </svg>
@@ -28,17 +28,17 @@
       <section class="panel-section">
         <div class="section-header">
           <h2>1. アイコン候補を追加</h2>
-          <span class="badge-hint">Ctrl+V 貼り付け対応</span>
+          <span class="badge-hint">自動軽量化・複数対応</span>
         </div>
-        <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="画像をドラッグ＆ドロップ、またはクリックして選択">
+        <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="画像をドラッグ＆ドロップ、またはタップして選択">
           <input type="file" id="file-input" accept="image/*" multiple hidden />
-          <svg class="dropzone-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <svg class="dropzone-icon" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
             <polyline points="17 8 12 3 7 8"/>
             <line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
-          <p class="dropzone-title">画像をドロップ / クリックして選択</p>
-          <p class="dropzone-sub">複数枚まとめアップロード可能（ブラウザ内処理・外部送信なし）</p>
+          <p id="dropzone-title" class="dropzone-title">画像をタップして選択 / ドロップ</p>
+          <p id="dropzone-sub" class="dropzone-sub">高画質な写真も自動で軽量リサイズして読み込みます</p>
         </div>
       </section>
 
@@ -51,98 +51,115 @@
             <button type="button" id="btn-clear-all" class="btn-text danger" title="すべてのアイコンをクリア">全削除</button>
           </div>
         </div>
-        <p class="helper-note">クリックで選択（数字キー <code>1</code>〜<code>9</code> でも切替可）。トリミングボタンで位置・拡大率を調整できます。</p>
+        <p class="helper-note">タップで選択。歯車ボタンで位置・拡大率を調整できます。</p>
         <div id="candidate-list" class="candidate-list"></div>
       </section>
 
-      <!-- プロフィール表示名・テキスト設定 -->
-      <section class="panel-section">
-        <div class="section-header">
+      <!-- プロフィール表示名・テキスト設定（スマホでは折りたたみ可能に） -->
+      <details class="panel-section profile-details" id="profile-details" open>
+        <summary class="section-header summary-toggle">
           <h2>3. プレビュー用プロフィール設定</h2>
+          <span class="summary-chevron">▾</span>
+        </summary>
+        <div class="profile-form-body">
+          <div class="form-group">
+            <label for="input-display-name">表示名 (Display Name)</label>
+            <input type="text" id="input-display-name" value="あなた (アイコン検証中)" maxlength="30" />
+          </div>
+          <div class="form-group">
+            <label for="input-handle">ユーザーID (@handle)</label>
+            <input type="text" id="input-handle" value="your_account" maxlength="25" />
+          </div>
+          <div class="form-group">
+            <label for="input-post-text">サンプル投稿文</label>
+            <textarea id="input-post-text" rows="2" maxlength="140">新しいSNSアイコンどれがいいか迷ってます！タイムラインでパッと見て誰だか分かりやすいのはどれでしょう？🎨✨</textarea>
+          </div>
         </div>
-        <div class="form-group">
-          <label for="input-display-name">表示名 (Display Name)</label>
-          <input type="text" id="input-display-name" value="あなた (アイコン検証中)" maxlength="30" />
-        </div>
-        <div class="form-group">
-          <label for="input-handle">ユーザーID (@handle)</label>
-          <input type="text" id="input-handle" value="your_account" maxlength="25" />
-        </div>
-        <div class="form-group">
-          <label for="input-post-text">サンプル投稿文</label>
-          <textarea id="input-post-text" rows="2" maxlength="140">新しいSNSアイコンどれがいいか迷ってます！タイムラインでパッと見て誰だか分かりやすいのはどれでしょう？🎨✨</textarea>
-        </div>
-      </section>
+      </details>
     </aside>
 
     <!-- メインコンテンツエリア -->
     <main class="main-area">
-      <!-- 上部ツールバー -->
-      <header class="toolbar">
-        <div class="toolbar-row">
-          <!-- 表示モード切替 -->
-          <div class="control-group">
-            <span class="control-label">比較モード</span>
-            <div class="segmented-control" id="compare-mode-tabs">
-              <button type="button" class="seg-btn active" data-mode="mix" title="複数の候補アイコンをタイムライン内に並べて同時比較します">
-                <span>タイムライン混在比較</span>
-              </button>
-              <button type="button" class="seg-btn" data-mode="single" title="選択中の1つのアイコンを全画面に適用して確認します">
-                <span>単一アイコン集中確認</span>
-              </button>
-              <button type="button" class="seg-btn" data-mode="matrix" title="全候補×各ピクセルサイズ×背景色をマトリクス表で比較します">
-                <span>サイズ・背景マトリクス表</span>
-              </button>
-            </div>
-          </div>
+      <!-- 上部ツールバー（スマホでは1行のスリムバー＋開閉式ドロワー） -->
+      <header class="toolbar" id="main-toolbar">
+        <!-- 常時表示のコンパクトバー：クイック候補切替 ＆ 背景色 ＆ 詳細フィルタ開閉ボタン -->
+        <div class="toolbar-compact-bar">
+          <div id="quick-switcher-bar" class="quick-switcher-bar"></div>
 
-          <!-- 背景テーマ切替 -->
-          <div class="control-group">
-            <span class="control-label">SNS背景色</span>
-            <div class="segmented-control" id="theme-tabs">
-              <button type="button" class="seg-btn active" data-theme="light">
-                <span class="theme-dot light-dot"></span>ライト
+          <div class="compact-right-controls">
+            <!-- 背景テーマ切替 -->
+            <div class="segmented-control compact-theme-tabs" id="theme-tabs" aria-label="SNS背景色">
+              <button type="button" class="seg-btn active" data-theme="light" title="ライト背景">
+                <span class="theme-dot light-dot"></span><span class="theme-label-text">白</span>
               </button>
-              <button type="button" class="seg-btn" data-theme="dim">
-                <span class="theme-dot dim-dot"></span>ディム(紺)
+              <button type="button" class="seg-btn" data-theme="dim" title="ディム(紺)背景">
+                <span class="theme-dot dim-dot"></span><span class="theme-label-text">紺</span>
               </button>
-              <button type="button" class="seg-btn" data-theme="dark">
-                <span class="theme-dot dark-dot"></span>ダーク(黒)
+              <button type="button" class="seg-btn" data-theme="dark" title="ダーク(黒)背景">
+                <span class="theme-dot dark-dot"></span><span class="theme-label-text">黒</span>
               </button>
             </div>
+
+            <!-- スマホ用：表示SNS・比較モード・識別性テストの開閉ボタン -->
+            <button type="button" id="btn-toggle-toolbar-drawer" class="btn-drawer-toggle" aria-expanded="false">
+              <span>表示切替・テスト</span>
+              <span id="active-filter-indicator" class="filter-dot hidden"></span>
+              <span class="drawer-chevron">▾</span>
+            </button>
           </div>
         </div>
 
-        <div class="toolbar-row secondary-row">
-          <!-- SNSプラットフォーム切替 (SNSモックアップ表示時) -->
-          <div class="control-group" id="platform-filter-group">
-            <span class="control-label">表示SNS</span>
-            <div class="pill-tabs" id="platform-tabs">
-              <button type="button" class="pill-btn active" data-platform="all">すべて表示</button>
-              <button type="button" class="pill-btn" data-platform="x">X (Twitter)</button>
-              <button type="button" class="pill-btn" data-platform="instagram">Instagram</button>
-              <button type="button" class="pill-btn" data-platform="discord">Discord</button>
-              <button type="button" class="pill-btn" data-platform="line">LINE</button>
-              <button type="button" class="pill-btn" data-platform="youtube">YouTube</button>
+        <!-- 詳細コントロール（PCでは常時表示、スマホではタップ時のみ開く） -->
+        <div id="toolbar-drawer" class="toolbar-drawer">
+          <div class="toolbar-row">
+            <!-- 比較モード切替 -->
+            <div class="control-group">
+              <span class="control-label">比較モード</span>
+              <div class="segmented-control scroll-x" id="compare-mode-tabs">
+                <button type="button" class="seg-btn active" data-mode="mix" title="複数の候補アイコンをタイムライン内に並べて同時比較します">
+                  <span>タイムライン混在</span>
+                </button>
+                <button type="button" class="seg-btn" data-mode="single" title="選択中の1つのアイコンを全画面に適用して確認します">
+                  <span>単一アイコン集中</span>
+                </button>
+                <button type="button" class="seg-btn" data-mode="matrix" title="全候補×各ピクセルサイズ×背景色をマトリクス表で比較します">
+                  <span>サイズ比較表</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- 識別性チェックフィルタ -->
+            <div class="control-group">
+              <span class="control-label">識別性テスト</span>
+              <div class="filter-toggles scroll-x">
+                <label class="toggle-chip" title="明度差（コントラスト）だけでアイコンが潰れていないか確認します">
+                  <input type="checkbox" id="chk-grayscale" />
+                  <span>白黒(明度)</span>
+                </label>
+                <label class="toggle-chip" title="流し見や縮小時にシルエットが判別できるか確認します">
+                  <input type="checkbox" id="chk-blur" />
+                  <span>ぼかし</span>
+                </label>
+                <label class="toggle-chip" title="画面を75%縮小して、スマホを少し離して見たときの視認性を確認します">
+                  <input type="checkbox" id="chk-small-scale" />
+                  <span>遠目(75%)</span>
+                </label>
+              </div>
             </div>
           </div>
 
-          <!-- 識別性チェックフィルタ -->
-          <div class="control-group">
-            <span class="control-label">識別性テスト</span>
-            <div class="filter-toggles">
-              <label class="toggle-chip" title="明度差（コントラスト）だけでアイコンが潰れていないか確認します">
-                <input type="checkbox" id="chk-grayscale" />
-                <span>白黒(明度)</span>
-              </label>
-              <label class="toggle-chip" title="流し見や縮小時にシルエットが判別できるか確認します">
-                <input type="checkbox" id="chk-blur" />
-                <span>ぼかし(シルエット)</span>
-              </label>
-              <label class="toggle-chip" title="画面を75%縮小して、スマホを少し離して見たときの視認性を確認します">
-                <input type="checkbox" id="chk-small-scale" />
-                <span>遠目表示(75%)</span>
-              </label>
+          <!-- SNSプラットフォーム切替 -->
+          <div class="toolbar-row" id="platform-filter-group">
+            <div class="control-group full-width-scroll">
+              <span class="control-label">表示SNS</span>
+              <div class="pill-tabs scroll-x" id="platform-tabs">
+                <button type="button" class="pill-btn active" data-platform="all">すべて</button>
+                <button type="button" class="pill-btn" data-platform="x">X (Twitter)</button>
+                <button type="button" class="pill-btn" data-platform="instagram">Instagram</button>
+                <button type="button" class="pill-btn" data-platform="discord">Discord</button>
+                <button type="button" class="pill-btn" data-platform="line">LINE</button>
+                <button type="button" class="pill-btn" data-platform="youtube">YouTube</button>
+              </div>
             </div>
           </div>
         </div>
@@ -150,9 +167,6 @@
 
       <!-- プレビューキャンバス -->
       <div id="preview-viewport" class="preview-viewport" data-sns-theme="light">
-        <!-- クイック候補スイッチャーバー（上部固定でいつでもポチポチ切り替え可能） -->
-        <div id="quick-switcher-bar" class="quick-switcher-bar"></div>
-
         <!-- SNSモックアップグリッド -->
         <div id="sns-mockups-container" class="sns-mockups-grid"></div>
 

@@ -1,16 +1,20 @@
 /**
  * SNS Icon Viewer - Main Application Logic
  * 複数候補のSNSアイコンを実際のSNS画面・各サイズ・各背景テーマに埋め込んで識別性を比較するアプリ
+ * (スマホでの高解像度写真の複数枚同時読み込みでもクラッシュしない省メモリ・逐次リサイズ設計)
  */
 
 (function () {
   "use strict";
 
+  // Preview max resolution (128px * 3x Retina = 384px is plenty sharp and uses < 0.5MB RAM per image)
+  const MAX_ICON_RESOLUTION = 384;
+
   // =========================================================================
   // State
   // =========================================================================
   const state = {
-    candidates: [], // { id, name, dataUrl, zoom: 100, panX: 0, panY: 0, isSample: bool, diagnostics: {...} }
+    candidates: [], // { id, name, dataUrl, isObjectUrl, zoom: 100, panX: 0, panY: 0, isSample: bool, diagnostics: {...} }
     activeId: null,
     compareMode: "mix", // "mix" | "single" | "matrix"
     theme: "light", // "light" | "dim" | "dark"
@@ -27,12 +31,13 @@
         "新しいSNSアイコンどれがいいか迷ってます！タイムラインでパッと見て誰だか分かりやすいのはどれでしょう？🎨✨",
     },
     editingCandidateId: null,
+    isDrawerOpen: false,
   };
 
   // Dummy accounts to mix into timelines for realistic visual noise
   const DUMMY_USERS = [
     {
-      name: "디자인メモ / UI研究",
+      name: "デザインメモ / UI研究",
       handle: "ui_design_note",
       text: "アイコンは40px〜32pxに縮小されたとき、シルエットと明度差がはっきりしているものほどタイムラインで埋もれません。",
       avatarUrl: createDummyAvatar("#6366f1", "#e0e7ff", "UI"),
@@ -49,15 +54,22 @@
   // DOM Elements
   // =========================================================================
   const dropzone = document.getElementById("dropzone");
+  const dropzoneTitle = document.getElementById("dropzone-title");
+  const dropzoneSub = document.getElementById("dropzone-sub");
   const fileInput = document.getElementById("file-input");
   const candidateListEl = document.getElementById("candidate-list");
   const candidateCountEl = document.getElementById("candidate-count");
   const btnLoadSamples = document.getElementById("btn-load-samples");
   const btnClearAll = document.getElementById("btn-clear-all");
+  const profileDetails = document.getElementById("profile-details");
 
   const inputDisplayName = document.getElementById("input-display-name");
   const inputHandle = document.getElementById("input-handle");
   const inputPostText = document.getElementById("input-post-text");
+
+  const btnToggleToolbarDrawer = document.getElementById("btn-toggle-toolbar-drawer");
+  const toolbarDrawer = document.getElementById("toolbar-drawer");
+  const activeFilterIndicator = document.getElementById("active-filter-indicator");
 
   const compareModeTabs = document.getElementById("compare-mode-tabs");
   const themeTabs = document.getElementById("theme-tabs");
@@ -92,21 +104,43 @@
   const btnExportCropped = document.getElementById("btn-export-cropped");
   const btnSaveCrop = document.getElementById("btn-save-crop");
 
+  // Collapse profile details by default on mobile so preview is closer to top
+  if (window.innerWidth <= 768 && profileDetails) {
+    profileDetails.removeAttribute("open");
+  }
+
+  // =========================================================================
+  // Memory Cleanup Helper
+  // =========================================================================
+  function revokeCandidateUrl(candidate) {
+    if (candidate && candidate.isObjectUrl && candidate.dataUrl) {
+      try {
+        URL.revokeObjectURL(candidate.dataUrl);
+      } catch (_) {}
+    }
+  }
+
+  function clearAllCandidates() {
+    state.candidates.forEach(revokeCandidateUrl);
+    state.candidates = [];
+    state.activeId = null;
+  }
+
   // =========================================================================
   // Sample & Dummy Avatar Generators
   // =========================================================================
   function createDummyAvatar(bg, fg, initials) {
     const c = document.createElement("canvas");
-    c.width = 160;
-    c.height = 160;
+    c.width = 120;
+    c.height = 120;
     const ctx = c.getContext("2d");
     ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, 160, 160);
+    ctx.fillRect(0, 0, 120, 120);
     ctx.fillStyle = fg;
-    ctx.font = "bold 62px sans-serif";
+    ctx.font = "bold 46px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(initials, 80, 84);
+    ctx.fillText(initials, 60, 63);
     return c.toDataURL("image/png");
   }
 
@@ -125,39 +159,33 @@
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, 256, 256);
 
-      // Shoulders
       ctx.fillStyle = "#1e293b";
       ctx.beginPath();
       ctx.arc(128, 255, 85, Math.PI, 0, false);
       ctx.fill();
 
-      // Hair back
       ctx.fillStyle = "#334155";
       ctx.beginPath();
       ctx.arc(128, 114, 68, 0, Math.PI * 2);
       ctx.fill();
 
-      // Face
       ctx.fillStyle = "#fff1e6";
       ctx.beginPath();
       ctx.arc(128, 122, 50, 0, Math.PI * 2);
       ctx.fill();
 
-      // Eyes
       ctx.fillStyle = "#0f172a";
       ctx.beginPath();
       ctx.arc(109, 120, 7, 0, Math.PI * 2);
       ctx.arc(147, 120, 7, 0, Math.PI * 2);
       ctx.fill();
 
-      // Smile
       ctx.strokeStyle = "#e11d48";
       ctx.lineWidth = 4;
       ctx.beginPath();
       ctx.arc(128, 132, 14, 0.15 * Math.PI, 0.85 * Math.PI);
       ctx.stroke();
 
-      // Bangs
       ctx.fillStyle = "#1e293b";
       ctx.beginPath();
       ctx.arc(128, 100, 54, Math.PI, 0, false);
@@ -165,7 +193,7 @@
 
       samples.push({
         name: "案A: 顔アップ(高視認)",
-        dataUrl: c.toDataURL("image/png"),
+        canvas: c,
       });
     }
 
@@ -183,11 +211,10 @@
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, 256, 256);
 
-      // Tiny full body character in center
       ctx.fillStyle = "#1e293b";
-      ctx.fillRect(118, 120, 20, 52); // torso
-      ctx.fillRect(118, 172, 8, 35); // leg L
-      ctx.fillRect(130, 172, 8, 35); // leg R
+      ctx.fillRect(118, 120, 20, 52);
+      ctx.fillRect(118, 172, 8, 35);
+      ctx.fillRect(130, 172, 8, 35);
       ctx.fillStyle = "#fde68a";
       ctx.beginPath();
       ctx.arc(128, 100, 16, 0, Math.PI * 2);
@@ -195,7 +222,7 @@
 
       samples.push({
         name: "案B: 全身引き(縮小注意)",
-        dataUrl: c.toDataURL("image/png"),
+        canvas: c,
       });
     }
 
@@ -214,7 +241,6 @@
       ctx.arc(128, 118, 52, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Cat ears
       ctx.beginPath();
       ctx.moveTo(85, 86);
       ctx.lineTo(74, 42);
@@ -224,7 +250,6 @@
       ctx.lineTo(142, 68);
       ctx.stroke();
 
-      // Eyes
       ctx.fillStyle = "#475569";
       ctx.beginPath();
       ctx.arc(108, 118, 5, 0, Math.PI * 2);
@@ -233,7 +258,7 @@
 
       samples.push({
         name: "案C: 白背景・線画",
-        dataUrl: c.toDataURL("image/png"),
+        canvas: c,
       });
     }
 
@@ -263,7 +288,7 @@
 
       samples.push({
         name: "案D: 黒背景・ロゴ風",
-        dataUrl: c.toDataURL("image/png"),
+        canvas: c,
       });
     }
 
@@ -271,131 +296,233 @@
   }
 
   // =========================================================================
-  // Image Diagnostics (Edge blend & Contrast check)
+  // Image Diagnostics (Computed directly from Canvas without extra Image decode)
   // =========================================================================
-  function analyzeIconImage(dataUrl) {
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.onload = () => {
-        const size = 64;
-        const c = document.createElement("canvas");
-        c.width = size;
-        c.height = size;
-        const ctx = c.getContext("2d");
-        ctx.drawImage(img, 0, 0, size, size);
-        const data = ctx.getImageData(0, 0, size, size).data;
+  function analyzeSourceCanvas(sourceCanvas) {
+    try {
+      const size = 64;
+      const c = document.createElement("canvas");
+      c.width = size;
+      c.height = size;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(sourceCanvas, 0, 0, size, size);
+      const data = ctx.getImageData(0, 0, size, size).data;
 
-        let edgeLumSum = 0;
-        let edgeCount = 0;
-        let lumValues = [];
+      let edgeLumSum = 0;
+      let edgeCount = 0;
+      const lumValues = [];
 
-        const center = size / 2;
-        for (let y = 0; y < size; y++) {
-          for (let x = 0; x < size; x++) {
-            const dx = x - center;
-            const dy = y - center;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist <= center) {
-              const idx = (y * size + x) * 4;
-              const a = data[idx + 3] / 255;
-              // Composite over mid-gray if transparent
-              const r = data[idx] * a + 128 * (1 - a);
-              const g = data[idx + 1] * a + 128 * (1 - a);
-              const b = data[idx + 2] * a + 128 * (1 - a);
-              const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-              lumValues.push(lum);
+      const center = size / 2;
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const dx = x - center;
+          const dy = y - center;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist <= center) {
+            const idx = (y * size + x) * 4;
+            const a = data[idx + 3] / 255;
+            const r = data[idx] * a + 128 * (1 - a);
+            const g = data[idx + 1] * a + 128 * (1 - a);
+            const b = data[idx + 2] * a + 128 * (1 - a);
+            const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            lumValues.push(lum);
 
-              if (dist >= center - 5) {
-                edgeLumSum += lum;
-                edgeCount++;
-              }
+            if (dist >= center - 5) {
+              edgeLumSum += lum;
+              edgeCount++;
             }
           }
         }
+      }
 
-        const avgEdgeLum = edgeCount > 0 ? edgeLumSum / edgeCount : 128;
-        const meanLum =
-          lumValues.reduce((acc, v) => acc + v, 0) / (lumValues.length || 1);
-        const variance =
-          lumValues.reduce((acc, v) => acc + Math.pow(v - meanLum, 2), 0) /
-          (lumValues.length || 1);
-        const stdDev = Math.sqrt(variance);
+      const avgEdgeLum = edgeCount > 0 ? edgeLumSum / edgeCount : 128;
+      const meanLum =
+        lumValues.reduce((acc, v) => acc + v, 0) / (lumValues.length || 1);
+      const variance =
+        lumValues.reduce((acc, v) => acc + Math.pow(v - meanLum, 2), 0) /
+        (lumValues.length || 1);
+      const stdDev = Math.sqrt(variance);
 
-        const tags = [];
-        if (avgEdgeLum > 235) {
-          tags.push({ text: "ライト背景で輪郭同化注意", type: "warn" });
-        } else if (avgEdgeLum < 25) {
-          tags.push({ text: "ダーク背景で輪郭同化注意", type: "warn" });
+      const tags = [];
+      if (avgEdgeLum > 235) {
+        tags.push({ text: "白背景同化注意", type: "warn" });
+      } else if (avgEdgeLum < 25) {
+        tags.push({ text: "黒背景同化注意", type: "warn" });
+      }
+
+      if (stdDev < 28) {
+        tags.push({ text: "明度差小", type: "warn" });
+      } else {
+        tags.push({ text: "明度くっきり", type: "good" });
+      }
+
+      return { tags };
+    } catch (_) {
+      return { tags: [] };
+    }
+  }
+
+  // =========================================================================
+  // Memory-Safe Image Downscaling & ObjectURL Creation
+  // =========================================================================
+  function canvasToOptimizedUrl(canvas) {
+    return new Promise((resolve) => {
+      if (typeof canvas.toBlob === "function") {
+        canvas.toBlob(
+          (blob) => {
+            if (blob) {
+              resolve({ url: URL.createObjectURL(blob), isObjectUrl: true });
+            } else {
+              resolve({
+                url: canvas.toDataURL("image/jpeg", 0.85),
+                isObjectUrl: false,
+              });
+            }
+          },
+          "image/webp",
+          0.88
+        );
+      } else {
+        resolve({
+          url: canvas.toDataURL("image/jpeg", 0.85),
+          isObjectUrl: false,
+        });
+      }
+    });
+  }
+
+  /**
+   * 1枚のFileを省メモリで読み込み、最大384px四方に縮小したBlob URLと診断結果を返す。
+   * 元の数MB〜十数MBのカメラ画像は即座にメモリ解放する。
+   */
+  function processSingleFile(file) {
+    return new Promise((resolve) => {
+      const tempRawUrl = URL.createObjectURL(file);
+      const img = new Image();
+
+      img.onload = async () => {
+        try {
+          const origW = img.naturalWidth || img.width || 256;
+          const origH = img.naturalHeight || img.height || 256;
+
+          // Center-crop square or keep aspect ratio inside MAX_ICON_RESOLUTION
+          const scale = Math.min(1, MAX_ICON_RESOLUTION / Math.max(origW, origH));
+          const targetW = Math.max(1, Math.round(origW * scale));
+          const targetH = Math.max(1, Math.round(origH * scale));
+
+          const canvas = document.createElement("canvas");
+          canvas.width = targetW;
+          canvas.height = targetH;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, targetW, targetH);
+
+          // Free original full-resolution bitmap immediately!
+          URL.revokeObjectURL(tempRawUrl);
+          img.src = "";
+
+          const diagnostics = analyzeSourceCanvas(canvas);
+          const { url, isObjectUrl } = await canvasToOptimizedUrl(canvas);
+
+          // Free temporary canvas memory on iOS Safari
+          canvas.width = 1;
+          canvas.height = 1;
+
+          resolve({ url, isObjectUrl, diagnostics });
+        } catch (err) {
+          URL.revokeObjectURL(tempRawUrl);
+          resolve(null);
         }
-
-        if (stdDev < 28) {
-          tags.push({ text: "明度差小(縮小注意)", type: "warn" });
-        } else {
-          tags.push({ text: "明度くっきり", type: "good" });
-        }
-
-        resolve({ tags });
       };
-      img.onerror = () => resolve({ tags: [] });
-      img.src = dataUrl;
+
+      img.onerror = () => {
+        URL.revokeObjectURL(tempRawUrl);
+        resolve(null);
+      };
+
+      img.src = tempRawUrl;
     });
   }
 
   // =========================================================================
   // Candidate Management
   // =========================================================================
-  async function addCandidate({ name, dataUrl, isSample = false }) {
-    // If adding first real user file while only samples exist, remove samples automatically
-    if (!isSample && state.candidates.length > 0 && state.candidates.every((c) => c.isSample)) {
-      state.candidates = [];
+  async function handleFiles(fileList) {
+    const files = Array.from(fileList).filter(
+      (f) => f.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|svg|heic)$/i.test(f.name)
+    );
+    if (files.length === 0) return;
+
+    // Remove built-in samples automatically when user uploads their first real images
+    if (state.candidates.length > 0 && state.candidates.every((c) => c.isSample)) {
+      clearAllCandidates();
     }
 
-    const id = "cand_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
-    const diagnostics = await analyzeIconImage(dataUrl);
-    const candidate = {
-      id,
-      name,
-      dataUrl,
-      zoom: 100,
-      panX: 0,
-      panY: 0,
-      isSample,
-      diagnostics,
-    };
-    state.candidates.push(candidate);
-    state.activeId = id;
+    // Show progress state on dropzone so user knows files are being compressed safely
+    const origTitle = dropzoneTitle.textContent;
+    const origSub = dropzoneSub.textContent;
+    dropzone.classList.add("loading");
+
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        dropzoneTitle.textContent = `画像を軽量化・読み込み中... (${i + 1} / ${files.length}枚)`;
+        dropzoneSub.textContent = file.name;
+
+        const result = await processSingleFile(file);
+        if (result) {
+          const baseName = file.name.replace(/\.[^/.]+$/, "");
+          const id =
+            "cand_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+
+          state.candidates.push({
+            id,
+            name: baseName.slice(0, 20) || `候補 ${state.candidates.length + 1}`,
+            dataUrl: result.url,
+            isObjectUrl: result.isObjectUrl,
+            zoom: 100,
+            panX: 0,
+            panY: 0,
+            isSample: false,
+            diagnostics: result.diagnostics,
+          });
+          state.activeId = id;
+        }
+
+        // Yield to browser GC between photos so mobile Safari never spikes RAM
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    } finally {
+      dropzone.classList.remove("loading");
+      dropzoneTitle.textContent = origTitle;
+      dropzoneSub.textContent = origSub;
+    }
+
+    // Render DOM only ONCE after all files are processed!
     renderAll();
   }
 
-  async function handleFiles(fileList) {
-    const files = Array.from(fileList).filter((f) => f.type.startsWith("image/"));
-    if (files.length === 0) return;
-
-    for (const file of files) {
-      const dataUrl = await readFileAsDataURL(file);
-      const baseName = file.name.replace(/\.[^/.]+$/, "");
-      await addCandidate({
-        name: baseName.slice(0, 20) || `候補 ${state.candidates.length + 1}`,
-        dataUrl,
-        isSample: false,
-      });
-    }
-  }
-
-  function readFileAsDataURL(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => resolve(e.target.result);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-  }
-
   async function loadSamples() {
-    state.candidates = [];
+    clearAllCandidates();
     const samples = generateSampleCandidates();
-    for (const s of samples) {
-      await addCandidate({ name: s.name, dataUrl: s.dataUrl, isSample: true });
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const diagnostics = analyzeSourceCanvas(s.canvas);
+      const { url, isObjectUrl } = await canvasToOptimizedUrl(s.canvas);
+      s.canvas.width = 1;
+      s.canvas.height = 1;
+
+      const id = "sample_" + i + "_" + Date.now();
+      state.candidates.push({
+        id,
+        name: s.name,
+        dataUrl: url,
+        isObjectUrl,
+        zoom: 100,
+        panX: 0,
+        panY: 0,
+        isSample: true,
+        diagnostics,
+      });
     }
     if (state.candidates.length > 0) {
       state.activeId = state.candidates[0].id;
@@ -411,7 +538,6 @@
     );
   }
 
-  // Returns candidate for slot index `slotIdx` depending on compareMode ("mix" vs "single")
   function getCandidateForSlot(slotIdx) {
     if (state.candidates.length === 0) return null;
     if (state.compareMode === "single") {
@@ -437,7 +563,7 @@
 
     return `
       <div class="avatar-frame ${sizeClass} ${extraClasses}" data-candidate-id="${candidate.id}" title="${escapeHtml(candidate.name)}">
-        <img src="${candidate.dataUrl}" alt="${escapeHtml(candidate.name)}" ${transformStyle} />
+        <img src="${candidate.dataUrl}" alt="${escapeHtml(candidate.name)}" decoding="async" ${transformStyle} />
       </div>
     `;
   }
@@ -466,12 +592,12 @@
 
     if (state.candidates.length === 0) {
       candidateListEl.innerHTML = `
-        <div style="padding: 14px; text-align: center; color: var(--ui-text-muted); font-size: 0.78rem; border: 1px dashed var(--ui-border); border-radius: 10px;">
-          アイコン候補がありません。<br/>上の枠に画像をドロップするか「サンプル復元」を押してください。
+        <div style="padding: 12px; text-align: center; color: var(--ui-text-muted); font-size: 0.76rem; border: 1px dashed var(--ui-border); border-radius: 10px;">
+          アイコン候補がありません。<br/>上の枠から画像を追加するか「サンプル復元」を押してください。
         </div>
       `;
       quickSwitcherBar.innerHTML = `
-        <span class="quick-switcher-label">候補アイコンをアップロードするとここに並びます</span>
+        <span class="quick-switcher-label">候補を追加するとここに並びます</span>
       `;
       return;
     }
@@ -489,8 +615,8 @@
           <div class="candidate-card ${isActive ? "active" : ""}" data-select-id="${c.id}">
             <span class="candidate-index">${i + 1}</span>
             <div class="candidate-thumbs">
-              ${renderAvatarFrame(c, "size-40")}
-              ${renderAvatarFrame(c, "size-24")}
+              ${renderAvatarFrame(c, "size-36")}
+              ${renderAvatarFrame(c, "size-20")}
             </div>
             <div class="candidate-info">
               <div class="candidate-name">${escapeHtml(c.name)}</div>
@@ -512,20 +638,15 @@
       })
       .join("");
 
-    // Quick Switcher Bar
-    const modeHint =
-      state.compareMode === "mix"
-        ? "現在「タイムライン混在比較」モード：全候補が各SNSのタイムライン内に並んで表示されています（クリックで主役アイコン切替）："
-        : "クリックで表示アイコンを瞬時に切り替え：";
-
+    // Compact Quick Switcher inside top bar
     quickSwitcherBar.innerHTML =
-      `<span class="quick-switcher-label">${modeHint}</span>` +
+      `<span class="quick-switcher-label">候補切替:</span>` +
       state.candidates
         .map((c, idx) => {
           const isActive = c.id === state.activeId;
           return `
             <button type="button" class="quick-chip ${isActive ? "active" : ""}" data-select-id="${c.id}">
-              ${renderAvatarFrame(c, "size-24")}
+              ${renderAvatarFrame(c, "size-20")}
               <span>#${idx + 1} ${escapeHtml(c.name)}</span>
             </button>
           `;
@@ -548,7 +669,6 @@
     // 1. X (Twitter) Card
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "x") {
-      // Build timeline posts: in mix mode, show every candidate as a post so user can compare all in one timeline!
       const feedCandidates =
         state.compareMode === "mix" && state.candidates.length > 0
           ? state.candidates
@@ -574,7 +694,6 @@
                 ${
                   idx === 0
                     ? `
-                  <!-- 引用ポスト内の極小20pxアイコン確認 -->
                   <div class="x-quote-box">
                     <div class="x-quote-header">
                       ${renderAvatarFrame(nextCand, "size-20")}
@@ -582,7 +701,7 @@
                       ${renderCandidateBadge(nextCand)}
                       <span class="x-post-handle">@${dHandle} · 20px引用表示</span>
                     </div>
-                    <div style="font-size: 0.76rem; color: var(--sns-subtext);">
+                    <div style="font-size: 0.74rem; color: var(--sns-subtext);">
                       引用リポスト内の極小アイコン（20px）でも誰だか判別できるかチェック！
                     </div>
                   </div>
@@ -601,14 +720,13 @@
         })
         .join("");
 
-      // Add a dummy user post + 32px reply to test how user icon looks next to other people
       const replyCand = getCandidateForSlot(1);
       const dummyUser = DUMMY_USERS[0];
 
       cards.push(`
         <article class="sns-card">
           <div class="sns-card-header">
-            <span>X (旧Twitter) プロフィール＆タイムライン</span>
+            <span>X (旧Twitter) プロフィール＆TL</span>
             <span class="size-tags">72px / 40px / 32px / 20px</span>
           </div>
 
@@ -629,11 +747,10 @@
 
           ${postsHtml}
 
-          <!-- 他人との並び＆32pxリプライ表示 -->
           <div class="x-post">
             <div class="x-post-avatar-col">
               <div class="avatar-frame size-40">
-                <img src="${dummyUser.avatarUrl}" alt="" />
+                <img src="${dummyUser.avatarUrl}" alt="" decoding="async" />
               </div>
               <div class="x-thread-line"></div>
             </div>
@@ -664,7 +781,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // 2. Instagram Card (Stories Ring + Feed Header + Comment)
+    // 2. Instagram Card
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "instagram") {
       const storyItemsCount = Math.max(state.candidates.length, 3);
@@ -697,15 +814,13 @@
         <article class="sns-card">
           <div class="sns-card-header">
             <span>Instagram ストーリーズ＆フィード</span>
-            <span class="size-tags">56px(虹色リング) / 32px / 24px</span>
+            <span class="size-tags">56px(リング) / 32px / 24px</span>
           </div>
 
-          <!-- Stories Bar -->
           <div class="ig-stories-bar">
             ${storiesHtml}
           </div>
 
-          <!-- Feed Post Header -->
           <div class="ig-feed-header">
             <div class="ig-feed-user">
               ${renderAvatarFrame(feedCand, "size-32")}
@@ -717,17 +832,16 @@
 
           <div class="ig-photo-placeholder">
             <div style="display: flex; align-items: center; gap: 12px;">
-              ${renderAvatarFrame(feedCand, "size-80")}
+              ${renderAvatarFrame(feedCand, "size-72")}
               <div>
-                <div style="font-weight: 700; font-size: 0.88rem;">プロフィール画面 (80px)</div>
-                <div style="font-size: 0.76rem; color: var(--sns-subtext);">
+                <div style="font-weight: 700; font-size: 0.84rem;">プロフィール画面 (72px)</div>
+                <div style="font-size: 0.74rem; color: var(--sns-subtext);">
                   虹色のストーリーリングが付いた時や、32pxのフィード投稿ヘッダーでの目立ち方を確認
                 </div>
               </div>
             </div>
           </div>
 
-          <!-- Comments -->
           <div class="ig-comments">
             <div class="ig-comment-row">
               ${renderAvatarFrame(commentCand1, "size-28")}
@@ -736,7 +850,7 @@
                 <span>コメント欄の28pxアイコン表示です。細かすぎる文字や背景は潰れやすくなります。</span>
               </div>
             </div>
-            <div class="ig-comment-row" style="padding-left: 26px;">
+            <div class="ig-comment-row" style="padding-left: 24px;">
               ${renderAvatarFrame(commentCand2, "size-24")}
               <div>
                 <strong>${dHandle}</strong> ${renderCandidateBadge(commentCand2)}
@@ -749,7 +863,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // 3. Discord Card (Chat + Online Cutout Dot + Server Member List)
+    // 3. Discord Card
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "discord") {
       const chatCandidates =
@@ -786,7 +900,7 @@
         state.candidates.length > 0 ? state.candidates : [activeCand]
       )
         .map(
-          (cand, idx) => `
+          (cand) => `
           <div class="discord-member-row">
             <div class="discord-avatar-wrap">
               ${renderAvatarFrame(cand, "size-32")}
@@ -806,7 +920,7 @@
         <article class="sns-card discord-surface">
           <div class="sns-card-header">
             <span>Discord チャット＆メンバー一覧</span>
-            <span class="size-tags">40px / 32px + 右下ステータスドット</span>
+            <span class="size-tags">40px / 32px + 右下ドット</span>
           </div>
           <div class="discord-layout">
             <div class="discord-chat-list">
@@ -818,7 +932,7 @@
               <div class="discord-member-row">
                 <div class="discord-avatar-wrap">
                   <div class="avatar-frame size-32">
-                    <img src="${DUMMY_USERS[1].avatarUrl}" alt="" />
+                    <img src="${DUMMY_USERS[1].avatarUrl}" alt="" decoding="async" />
                   </div>
                   <span class="status-dot"></span>
                 </div>
@@ -831,7 +945,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // 4. LINE Card (Talk List 48px + Chat Room 36px)
+    // 4. LINE Card
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "line") {
       const talkCand1 = getCandidateForSlot(0);
@@ -839,7 +953,7 @@
 
       const chatRoomCandidates =
         state.compareMode === "mix" && state.candidates.length > 0
-          ? state.candidates.slice(0, 3)
+          ? state.candidates
           : [activeCand];
 
       cards.push(`
@@ -892,10 +1006,10 @@
                 ${renderAvatarFrame(cand, "size-36")}
                 <div>
                   <div class="line-sender-name">${dName} ${
-                   state.compareMode === "mix" && cand
-                    ? `(${escapeHtml(cand.name)})`
-                    : ""
-                }</div>
+                    state.compareMode === "mix" && cand
+                      ? `(${escapeHtml(cand.name)})`
+                      : ""
+                  }</div>
                   <div class="line-bubble">
                     青みがかったトーク背景の上での36pxアイコンの視認性はどうですか？
                   </div>
@@ -910,7 +1024,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // 5. YouTube Card (Channel Bar + Comments 40px & Reply 24px)
+    // 5. YouTube Card
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "youtube") {
       const chCand = getCandidateForSlot(0);
@@ -947,7 +1061,7 @@
                   <div>
                     <span class="yt-comment-author ${i === 0 ? "owner-pill" : ""}">@${dHandle}</span>
                     ${renderCandidateBadge(cand)}
-                    <span style="font-size: 0.72rem; color: var(--sns-subtext); margin-left: 4px;">
+                    <span style="font-size: 0.7rem; color: var(--sns-subtext); margin-left: 4px;">
                       ${i === 0 ? "40px コメント" : "24px 返信コメント"}
                     </span>
                   </div>
@@ -989,11 +1103,11 @@
         return `
           <tr>
             <td>
-              <div style="display: flex; align-items: center; gap: 10px;">
-                ${renderAvatarFrame(cand, "size-40")}
+              <div style="display: flex; align-items: center; gap: 8px;">
+                ${renderAvatarFrame(cand, "size-36")}
                 <div>
-                  <div style="font-weight: 700; font-size: 0.85rem;">#${idx + 1} ${escapeHtml(cand.name)}</div>
-                  <div style="margin-top: 3px; display: flex; gap: 4px; flex-wrap: wrap;">${diagHtml}</div>
+                  <div style="font-weight: 700; font-size: 0.8rem;">#${idx + 1} ${escapeHtml(cand.name)}</div>
+                  <div style="margin-top: 2px; display: flex; gap: 3px; flex-wrap: wrap;">${diagHtml}</div>
                 </div>
               </div>
             </td>
@@ -1004,16 +1118,16 @@
             <td>${renderAvatarFrame(cand, "size-24")}</td>
             <td>${renderAvatarFrame(cand, "size-16")}</td>
             <td>
-              <div style="display: inline-flex; gap: 8px; align-items: center;">
-                <span class="bg-swatch-row bg-swatch-light" title="ライト(白)背景">${renderAvatarFrame(cand, "size-36")}</span>
-                <span class="bg-swatch-row bg-swatch-dim" title="ディム(紺)背景">${renderAvatarFrame(cand, "size-36")}</span>
-                <span class="bg-swatch-row bg-swatch-dark" title="ダーク(黒)背景">${renderAvatarFrame(cand, "size-36")}</span>
+              <div style="display: inline-flex; gap: 6px; align-items: center;">
+                <span class="bg-swatch-row bg-swatch-light" title="ライト(白)背景">${renderAvatarFrame(cand, "size-32")}</span>
+                <span class="bg-swatch-row bg-swatch-dim" title="ディム(紺)背景">${renderAvatarFrame(cand, "size-32")}</span>
+                <span class="bg-swatch-row bg-swatch-dark" title="ダーク(黒)背景">${renderAvatarFrame(cand, "size-32")}</span>
               </div>
             </td>
             <td>
-              <div style="display: inline-flex; gap: 10px; align-items: center;">
-                ${renderAvatarFrame(cand, "size-40", "shape-squircle")}
-                ${renderAvatarFrame(cand, "size-40", "shape-rounded")}
+              <div style="display: inline-flex; gap: 8px; align-items: center;">
+                ${renderAvatarFrame(cand, "size-36", "shape-squircle")}
+                ${renderAvatarFrame(cand, "size-36", "shape-rounded")}
               </div>
             </td>
           </tr>
@@ -1024,7 +1138,7 @@
     matrixViewContainer.innerHTML = `
       <div class="matrix-card">
         <h3>全候補 × ピクセルサイズ・背景色・形状 一覧比較マトリクス</h3>
-        <p>128pxのプロフィールサイズから16pxの極小バッジ、白/紺/黒の3背景、角丸四角形状まで横並びで一気に比較できます。</p>
+        <p>128pxのプロフィールサイズから16pxの極小バッジ、白/紺/黒の3背景、角丸四角形状まで横並びで比較できます。</p>
         <table class="matrix-table">
           <thead>
             <tr>
@@ -1060,6 +1174,17 @@
     previewViewport.classList.toggle("filter-grayscale", state.filters.grayscale);
     previewViewport.classList.toggle("filter-blur", state.filters.blur);
     previewViewport.classList.toggle("filter-small-scale", state.filters.smallScale);
+
+    // Update mobile filter indicator dot if any filter/mode is changed from default
+    const hasCustomSetting =
+      state.filters.grayscale ||
+      state.filters.blur ||
+      state.filters.smallScale ||
+      state.platform !== "all" ||
+      state.compareMode !== "mix";
+    if (activeFilterIndicator) {
+      activeFilterIndicator.classList.toggle("hidden", !hasCustomSetting);
+    }
 
     // Toggle Matrix vs Mockups
     if (state.compareMode === "matrix") {
@@ -1142,7 +1267,6 @@
       const panX = Number(sliderPanX.value) / 100;
       const panY = Number(sliderPanY.value) / 100;
 
-      // Simulate object-fit: cover + scale + translate
       const imgAspect = img.width / img.height;
       let drawW = outSize;
       let drawH = outSize;
@@ -1248,6 +1372,19 @@
     }
   });
 
+  // Mobile Toolbar Drawer Toggle
+  if (btnToggleToolbarDrawer) {
+    btnToggleToolbarDrawer.addEventListener("click", () => {
+      state.isDrawerOpen = !state.isDrawerOpen;
+      toolbarDrawer.classList.toggle("open", state.isDrawerOpen);
+      btnToggleToolbarDrawer.classList.toggle("active", state.isDrawerOpen);
+      btnToggleToolbarDrawer.setAttribute(
+        "aria-expanded",
+        state.isDrawerOpen ? "true" : "false"
+      );
+    });
+  }
+
   // Candidate List & Quick Switcher Delegation
   document.addEventListener("click", (e) => {
     const cropBtn = e.target.closest("[data-crop-id]");
@@ -1261,6 +1398,8 @@
     if (delBtn) {
       e.stopPropagation();
       const id = delBtn.getAttribute("data-delete-id");
+      const target = state.candidates.find((c) => c.id === id);
+      revokeCandidateUrl(target);
       state.candidates = state.candidates.filter((c) => c.id !== id);
       if (state.activeId === id) {
         state.activeId = state.candidates[0]?.id || null;
@@ -1302,8 +1441,7 @@
 
   btnLoadSamples.addEventListener("click", () => loadSamples());
   btnClearAll.addEventListener("click", () => {
-    state.candidates = [];
-    state.activeId = null;
+    clearAllCandidates();
     renderAll();
   });
 
