@@ -45,13 +45,16 @@
       <!-- 候補リスト -->
       <section class="panel-section candidates-section">
         <div class="section-header">
-          <h2>2. 候補一覧 <span id="candidate-count" class="count-pill">0</span></h2>
+          <h2>
+            2. 候補一覧 <span id="candidate-count" class="count-pill">0</span>
+            <span id="save-status-badge" class="badge-saved">💾 自動保存</span>
+          </h2>
           <div class="section-actions">
             <button type="button" id="btn-load-samples" class="btn-text" title="サンプルアイコンを再読み込み">サンプル復元</button>
             <button type="button" id="btn-clear-all" class="btn-text danger" title="すべてのアイコンをクリア">全削除</button>
           </div>
         </div>
-        <p class="helper-note">各候補の「<strong>✂️ 位置調整</strong>」ボタンから、切り抜かれる前の元画像全体を動かして位置・拡大率を調整できます。</p>
+        <p class="helper-note">何枚でも追加でき、ページを閉じてもブラウザ内に自動保存されます。「<strong>✂️ 位置調整</strong>」で元画像全体から切り抜き位置を調整できます。</p>
         <div id="candidate-list" class="candidate-list"></div>
       </section>
 

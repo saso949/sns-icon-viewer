@@ -1,8 +1,9 @@
 /**
  * SNS Icon Viewer - Main Application Logic
  * 複数候補のSNSアイコンを実際のSNS画面・各サイズ・各背景テーマに埋め込んで識別性を比較するアプリ
- * - 元画像はアスペクト比を維持したままクロップせずに軽量保持 (最大768px)
+ * - 元画像はアスペクト比を維持したままクロップせずに保持 (最大768px)
  * - 位置調整モーダルでは「切り抜かれる前の元画像全体（円の枠外も含む）」を見ながら自由自在にドラッグ・拡縮可能
+ * - IndexedDB により、何枚でも候補を保存でき、ページやブラウザを閉じても次回アクセス時に自動復元
  */
 
 (function () {
@@ -13,6 +14,12 @@
   // Resolution of cropped square avatar used across previews
   const CROPPED_AVATAR_SIZE = 384;
 
+  // IndexedDB constants for persistent storage across page reloads (no 5MB localStorage limit!)
+  const IDB_NAME = "sns_icon_viewer_db";
+  const IDB_VERSION = 1;
+  const IDB_STORE = "app_state";
+  const IDB_KEY = "saved_session_v1";
+
   // =========================================================================
   // State
   // =========================================================================
@@ -20,8 +27,10 @@
     // Each candidate:
     // {
     //   id, name,
-    //   sourceUrl, isSourceObjectUrl, sourceW, sourceH,
-    //   dataUrl (cropped square url), isCroppedObjectUrl,
+    //   sourceUrl (Blob URL for fast DOM), sourceDataUrl (Base64 WebP/PNG for IndexedDB persistence),
+    //   isSourceObjectUrl, sourceW, sourceH,
+    //   dataUrl (Blob URL of cropped square), croppedDataUrl (Base64 WebP/PNG for IndexedDB persistence),
+    //   isCroppedObjectUrl,
     //   zoom: 100, panX: 0, panY: 0,
     //   isSample: bool, diagnostics: {...}
     // }
@@ -71,6 +80,7 @@
   const fileInput = document.getElementById("file-input");
   const candidateListEl = document.getElementById("candidate-list");
   const candidateCountEl = document.getElementById("candidate-count");
+  const saveStatusBadge = document.getElementById("save-status-badge");
   const btnLoadSamples = document.getElementById("btn-load-samples");
   const btnClearAll = document.getElementById("btn-clear-all");
   const profileDetails = document.getElementById("profile-details");
@@ -123,6 +133,172 @@
   }
 
   // =========================================================================
+  // IndexedDB Persistence (Supports unlimited candidates across page reloads)
+  // =========================================================================
+  function openDatabase() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) {
+        reject(new Error("IndexedDB not supported"));
+        return;
+      }
+      const req = window.indexedDB.open(IDB_NAME, IDB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+      req.onsuccess = (e) => resolve(e.target.result);
+      req.onerror = (e) => reject(e.target.error);
+    });
+  }
+
+  let saveTimer = null;
+  function scheduleSaveState() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveStateToStorage();
+    }, 180);
+  }
+
+  async function saveStateToStorage() {
+    try {
+      const payload = {
+        activeId: state.activeId,
+        compareMode: state.compareMode,
+        theme: state.theme,
+        platform: state.platform,
+        profile: { ...state.profile },
+        candidates: state.candidates.map((c) => ({
+          id: c.id,
+          name: c.name,
+          sourceDataUrl: c.sourceDataUrl || c.sourceUrl,
+          sourceW: c.sourceW,
+          sourceH: c.sourceH,
+          croppedDataUrl: c.croppedDataUrl || c.dataUrl,
+          zoom: c.zoom,
+          panX: c.panX,
+          panY: c.panY,
+          isSample: Boolean(c.isSample),
+          diagnostics: c.diagnostics || { tags: [] },
+        })),
+      };
+
+      const db = await openDatabase();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, "readwrite");
+        const store = tx.objectStore(IDB_STORE);
+        store.put(payload, IDB_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = (e) => reject(e.target.error);
+      });
+      db.close();
+
+      if (saveStatusBadge) {
+        saveStatusBadge.textContent = "💾 自動保存済み";
+      }
+    } catch (_) {
+      // Fallback: ignore if private browsing blocks IDB
+    }
+  }
+
+  function dataUrlToBlobUrl(dataUrl) {
+    try {
+      if (!dataUrl || !dataUrl.startsWith("data:")) {
+        return { url: dataUrl, isObjectUrl: false };
+      }
+      const parts = dataUrl.split(",");
+      const mimeMatch = parts[0].match(/:(.*?);/);
+      const mime = mimeMatch ? mimeMatch[1] : "image/png";
+      const bstr = atob(parts[1]);
+      let n = bstr.length;
+      const u8arr = new Uint8Array(n);
+      while (n--) {
+        u8arr[n] = bstr.charCodeAt(n);
+      }
+      const blob = new Blob([u8arr], { type: mime });
+      return { url: URL.createObjectURL(blob), isObjectUrl: true };
+    } catch (_) {
+      return { url: dataUrl, isObjectUrl: false };
+    }
+  }
+
+  async function loadStateFromStorage() {
+    try {
+      const db = await openDatabase();
+      const saved = await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, "readonly");
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.get(IDB_KEY);
+        req.onsuccess = (e) => resolve(e.target.result || null);
+        req.onerror = (e) => reject(e.target.error);
+      });
+      db.close();
+
+      if (!saved || !Array.isArray(saved.candidates) || saved.candidates.length === 0) {
+        return false;
+      }
+
+      clearAllCandidates();
+
+      for (const item of saved.candidates) {
+        const srcObj = dataUrlToBlobUrl(item.sourceDataUrl);
+        const cropObj = dataUrlToBlobUrl(item.croppedDataUrl);
+        state.candidates.push({
+          id: item.id,
+          name: item.name,
+          sourceUrl: srcObj.url,
+          sourceDataUrl: item.sourceDataUrl,
+          isSourceObjectUrl: srcObj.isObjectUrl,
+          sourceW: item.sourceW || 256,
+          sourceH: item.sourceH || 256,
+          dataUrl: cropObj.url,
+          croppedDataUrl: item.croppedDataUrl,
+          isCroppedObjectUrl: cropObj.isObjectUrl,
+          zoom: item.zoom || 100,
+          panX: item.panX || 0,
+          panY: item.panY || 0,
+          isSample: Boolean(item.isSample),
+          diagnostics: item.diagnostics || { tags: [] },
+        });
+      }
+
+      state.activeId =
+        saved.activeId && state.candidates.some((c) => c.id === saved.activeId)
+          ? saved.activeId
+          : state.candidates[0]?.id || null;
+
+      if (saved.compareMode) state.compareMode = saved.compareMode;
+      if (saved.theme) state.theme = saved.theme;
+      if (saved.platform) state.platform = saved.platform;
+      if (saved.profile) {
+        state.profile = { ...state.profile, ...saved.profile };
+        inputDisplayName.value = state.profile.displayName;
+        inputHandle.value = state.profile.handle;
+        inputPostText.value = state.profile.postText;
+      }
+
+      syncToolbarButtonsWithState();
+      renderAll();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function syncToolbarButtonsWithState() {
+    compareModeTabs.querySelectorAll(".seg-btn").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-mode") === state.compareMode);
+    });
+    themeTabs.querySelectorAll(".seg-btn").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-theme") === state.theme);
+    });
+    platformTabs.querySelectorAll(".pill-btn").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-platform") === state.platform);
+    });
+  }
+
+  // =========================================================================
   // Memory Cleanup Helper
   // =========================================================================
   function revokeCandidateUrls(candidate) {
@@ -148,10 +324,6 @@
   // =========================================================================
   // Geometry & Cropping Math (Shared by Crop Stage & Cropped Square Generator)
   // =========================================================================
-  /**
-   * 円の直径 targetSize に対する画像の描画サイズ (drawW, drawH) と中心オフセット (offsetX, offsetY) を計算
-   * zoom=100% のとき、画像の短辺が targetSize に一致する（長辺はみ出し分は panX/panY で端まで移動可能）
-   */
   function computeCropGeometry(sourceW, sourceH, targetSize, zoom, panX, panY) {
     const aspect = (sourceW || 1) / (sourceH || 1);
     const baseW = aspect >= 1 ? targetSize * aspect : targetSize;
@@ -164,9 +336,6 @@
     return { baseW, baseH, drawW, drawH, offsetX, offsetY };
   }
 
-  /**
-   * 元画像 sourceImgOrCanvas から (zoom, panX, panY) に基づいて正方形クロップ済み Canvas を生成する
-   */
   function createCroppedCanvas(sourceImgOrCanvas, sourceW, sourceH, outSize, zoom, panX, panY) {
     const canvas = document.createElement("canvas");
     canvas.width = outSize;
@@ -209,7 +378,7 @@
   function generateSampleCandidates() {
     const samples = [];
 
-    // Sample A: Closeup character (Portrait 3:4 aspect ratio so user can also test vertical panning!)
+    // Sample A: Closeup character (Portrait 3:4 aspect ratio)
     {
       const c = document.createElement("canvas");
       c.width = 256;
@@ -221,39 +390,33 @@
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, 256, 340);
 
-      // Torso/Shoulders extending down
       ctx.fillStyle = "#1e293b";
       ctx.beginPath();
       ctx.arc(128, 320, 105, Math.PI, 0, false);
       ctx.fill();
 
-      // Hair back
       ctx.fillStyle = "#334155";
       ctx.beginPath();
       ctx.arc(128, 150, 68, 0, Math.PI * 2);
       ctx.fill();
 
-      // Face
       ctx.fillStyle = "#fff1e6";
       ctx.beginPath();
       ctx.arc(128, 158, 50, 0, Math.PI * 2);
       ctx.fill();
 
-      // Eyes
       ctx.fillStyle = "#0f172a";
       ctx.beginPath();
       ctx.arc(109, 156, 7, 0, Math.PI * 2);
       ctx.arc(147, 156, 7, 0, Math.PI * 2);
       ctx.fill();
 
-      // Smile
       ctx.strokeStyle = "#e11d48";
       ctx.lineWidth = 4;
       ctx.beginPath();
       ctx.arc(128, 168, 14, 0.15 * Math.PI, 0.85 * Math.PI);
       ctx.stroke();
 
-      // Bangs
       ctx.fillStyle = "#1e293b";
       ctx.beginPath();
       ctx.arc(128, 136, 54, Math.PI, 0, false);
@@ -279,7 +442,6 @@
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, 256, 340);
 
-      // Full body character
       ctx.fillStyle = "#1e293b";
       ctx.fillRect(116, 155, 24, 65);
       ctx.fillRect(116, 220, 10, 48);
@@ -295,7 +457,7 @@
       });
     }
 
-    // Sample C: Pure white background + thin line art (Blends in Light Mode)
+    // Sample C: Pure white background + thin line art
     {
       const c = document.createElement("canvas");
       c.width = 256;
@@ -331,7 +493,7 @@
       });
     }
 
-    // Sample D: Dark background + neon emblem (Blends in Dark Mode)
+    // Sample D: Dark background + neon emblem
     {
       const c = document.createElement("canvas");
       c.width = 256;
@@ -435,38 +597,27 @@
   }
 
   // =========================================================================
-  // Memory-Safe Image Downscaling & ObjectURL Creation (Preserves Full Aspect Ratio!)
+  // Memory-Safe Image Downscaling & Dual URL (ObjectURL for DOM + DataURL for IDB)
   // =========================================================================
-  function canvasToOptimizedUrl(canvas) {
-    return new Promise((resolve) => {
-      if (typeof canvas.toBlob === "function") {
-        canvas.toBlob(
-          (blob) => {
-            if (blob) {
-              resolve({ url: URL.createObjectURL(blob), isObjectUrl: true });
-            } else {
-              resolve({
-                url: canvas.toDataURL("image/png"),
-                isObjectUrl: false,
-              });
-            }
-          },
-          "image/webp",
-          0.9
-        );
-      } else {
-        resolve({
-          url: canvas.toDataURL("image/png"),
-          isObjectUrl: false,
-        });
+  function canvasToUrls(canvas) {
+    // Compact WebP (or PNG fallback) DataURL for IndexedDB storage + Blob ObjectURL for fast DOM rendering
+    let dataUrl = "";
+    try {
+      dataUrl = canvas.toDataURL("image/webp", 0.88);
+      if (!dataUrl.startsWith("data:image/webp")) {
+        dataUrl = canvas.toDataURL("image/png");
       }
-    });
+    } catch (_) {
+      dataUrl = canvas.toDataURL("image/png");
+    }
+    const blobObj = dataUrlToBlobUrl(dataUrl);
+    return {
+      url: blobObj.url,
+      dataUrl,
+      isObjectUrl: blobObj.isObjectUrl,
+    };
   }
 
-  /**
-   * 1枚のFileを省メモリで読み込み、アスペクト比を維持したまま（一切クロップせず）最大768pxに軽量化した
-   * sourceUrl と、初期状態の正方形プレビュー用 croppedUrl を生成する。
-   */
   function processSingleFile(file) {
     return new Promise((resolve) => {
       const tempRawUrl = URL.createObjectURL(file);
@@ -504,10 +655,9 @@
           );
           const diagnostics = analyzeCroppedCanvas(croppedCanvas);
 
-          const sourceObj = await canvasToOptimizedUrl(sourceCanvas);
-          const croppedObj = await canvasToOptimizedUrl(croppedCanvas);
+          const sourceObj = canvasToUrls(sourceCanvas);
+          const croppedObj = canvasToUrls(croppedCanvas);
 
-          // Release temporary canvases
           sourceCanvas.width = 1;
           sourceCanvas.height = 1;
           croppedCanvas.width = 1;
@@ -515,10 +665,12 @@
 
           resolve({
             sourceUrl: sourceObj.url,
+            sourceDataUrl: sourceObj.dataUrl,
             isSourceObjectUrl: sourceObj.isObjectUrl,
             sourceW,
             sourceH,
             croppedUrl: croppedObj.url,
+            croppedDataUrl: croppedObj.dataUrl,
             isCroppedObjectUrl: croppedObj.isObjectUrl,
             diagnostics,
           });
@@ -538,14 +690,18 @@
   }
 
   // =========================================================================
-  // Candidate Management
+  // Candidate Management (Unlimited candidates!)
   // =========================================================================
   async function handleFiles(fileList) {
-    const files = Array.from(fileList).filter(
-      (f) => f.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|svg|heic)$/i.test(f.name)
+    // Copy File objects into an array BEFORE any async await
+    const files = Array.from(fileList || []).filter(
+      (f) =>
+        (f.type && f.type.startsWith("image/")) ||
+        /\.(png|jpe?g|webp|gif|svg|bmp|avif|heic|heif)$/i.test(f.name || "")
     );
     if (files.length === 0) return;
 
+    // If only default samples exist, replace them when user uploads real images
     if (state.candidates.length > 0 && state.candidates.every((c) => c.isSample)) {
       clearAllCandidates();
     }
@@ -564,18 +720,20 @@
 
         const result = await processSingleFile(file);
         if (result) {
-          const baseName = file.name.replace(/\.[^/.]+$/, "");
+          const baseName = (file.name || "").replace(/\.[^/.]+$/, "");
           const id =
-            "cand_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+            "cand_" + Date.now() + "_" + i + "_" + Math.random().toString(36).slice(2, 7);
 
           state.candidates.push({
             id,
             name: baseName.slice(0, 20) || `候補 ${state.candidates.length + 1}`,
             sourceUrl: result.sourceUrl,
+            sourceDataUrl: result.sourceDataUrl,
             isSourceObjectUrl: result.isSourceObjectUrl,
             sourceW: result.sourceW,
             sourceH: result.sourceH,
             dataUrl: result.croppedUrl,
+            croppedDataUrl: result.croppedDataUrl,
             isCroppedObjectUrl: result.isCroppedObjectUrl,
             zoom: 100,
             panX: 0,
@@ -587,7 +745,8 @@
           newlyAddedIds.push(id);
         }
 
-        await new Promise((r) => setTimeout(r, 25));
+        // Yield briefly between files so mobile browsers can GC decoded bitmaps
+        await new Promise((r) => setTimeout(r, 20));
       }
     } finally {
       dropzone.classList.remove("loading");
@@ -596,8 +755,9 @@
     }
 
     renderAll();
+    scheduleSaveState();
 
-    // If user uploaded 1 image, open the full-image crop/position modal right away so they can frame it!
+    // If user uploaded 1 single image, open the cropper so they can immediately adjust its position if desired
     if (newlyAddedIds.length === 1) {
       openCropModal(newlyAddedIds[0]);
     }
@@ -621,8 +781,8 @@
       );
       const diagnostics = analyzeCroppedCanvas(croppedCanvas);
 
-      const sourceObj = await canvasToOptimizedUrl(s.canvas);
-      const croppedObj = await canvasToOptimizedUrl(croppedCanvas);
+      const sourceObj = canvasToUrls(s.canvas);
+      const croppedObj = canvasToUrls(croppedCanvas);
 
       s.canvas.width = 1;
       s.canvas.height = 1;
@@ -634,10 +794,12 @@
         id,
         name: s.name,
         sourceUrl: sourceObj.url,
+        sourceDataUrl: sourceObj.dataUrl,
         isSourceObjectUrl: sourceObj.isObjectUrl,
         sourceW,
         sourceH,
         dataUrl: croppedObj.url,
+        croppedDataUrl: croppedObj.dataUrl,
         isCroppedObjectUrl: croppedObj.isObjectUrl,
         zoom: 100,
         panX: 0,
@@ -650,6 +812,7 @@
       state.activeId = state.candidates[0].id;
     }
     renderAll();
+    scheduleSaveState();
   }
 
   function getActiveCandidate() {
@@ -702,7 +865,7 @@
   // Render Sidebar Candidate List & Quick Switcher
   // =========================================================================
   function renderCandidateList() {
-    candidateCountEl.textContent = state.candidates.length;
+    candidateCountEl.textContent = `${state.candidates.length}件`;
 
     if (state.candidates.length === 0) {
       candidateListEl.innerHTML = `
@@ -716,7 +879,7 @@
       return;
     }
 
-    candidateListEl.innerHTML = state.candidates
+    const cardsHtml = state.candidates
       .map((c, i) => {
         const isActive = c.id === state.activeId;
         const diagHtml = (c.diagnostics?.tags || [])
@@ -748,6 +911,11 @@
       })
       .join("");
 
+    // Add a convenient "+ さらに候補画像を追加" button at the bottom of the list
+    candidateListEl.innerHTML =
+      cardsHtml +
+      `<button type="button" class="btn-add-more-inline" id="btn-add-more-inline">＋ さらに候補画像を追加する（何枚でも可）</button>`;
+
     const activeCand = getActiveCandidate();
     const quickCropBtnHtml = activeCand
       ? `<button type="button" class="quick-crop-btn" data-crop-id="${activeCand.id}" title="選択中アイコンの切り抜き位置を調整">✂️ 位置調整</button>`
@@ -769,7 +937,7 @@
   }
 
   // =========================================================================
-  // Render SNS Mockups
+  // Render SNS Mockups (Renders ALL candidates in Mix mode without any 3-item cap!)
   // =========================================================================
   function renderSnsMockups() {
     const activeCand = getActiveCandidate();
@@ -777,18 +945,18 @@
     const dHandle = escapeHtml((state.profile.handle || "your_account").replace(/^@/, ""));
     const dText = escapeHtml(state.profile.postText);
 
+    const allOrActiveCandidates =
+      state.compareMode === "mix" && state.candidates.length > 0
+        ? state.candidates
+        : [activeCand];
+
     const cards = [];
 
     // -----------------------------------------------------------------------
     // 1. X (Twitter) Card
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "x") {
-      const feedCandidates =
-        state.compareMode === "mix" && state.candidates.length > 0
-          ? state.candidates
-          : [activeCand];
-
-      const postsHtml = feedCandidates
+      const postsHtml = allOrActiveCandidates
         .map((cand, idx) => {
           const nextCand = getCandidateForSlot(idx + 1);
           return `
@@ -895,7 +1063,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // 2. Instagram Card
+    // 2. Instagram Card (All candidates in Stories & Comments)
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "instagram") {
       const storyItemsCount = Math.max(state.candidates.length, 3);
@@ -904,7 +1072,7 @@
         const cand = getCandidateForSlot(i);
         const label =
           state.compareMode === "mix" && cand
-            ? cand.name
+            ? `#${(i % state.candidates.length) + 1} ${cand.name}`
             : i === 0
             ? "ストーリーズ"
             : dHandle;
@@ -920,15 +1088,30 @@
         `;
       }
 
-      const feedCand = getCandidateForSlot(0);
-      const commentCand1 = getCandidateForSlot(1);
-      const commentCand2 = getCandidateForSlot(2);
+      const feedCand = activeCand;
+      const igCommentsHtml = allOrActiveCandidates
+        .map(
+          (cand, idx) => `
+          <div class="ig-comment-row" ${idx % 2 === 1 ? 'style="padding-left: 22px;"' : ""}>
+            ${renderAvatarFrame(cand, idx % 2 === 0 ? "size-28" : "size-24")}
+            <div>
+              <strong>${dHandle}</strong> ${renderCandidateBadge(cand)}
+              <span>${
+                idx % 2 === 0
+                  ? "コメント欄の28pxアイコン表示です。細かすぎる文字や背景は潰れやすくなります。"
+                  : "返信コメントの極小24pxサイズでの見え方チェック！"
+              }</span>
+            </div>
+          </div>
+        `
+        )
+        .join("");
 
       cards.push(`
         <article class="sns-card">
           <div class="sns-card-header">
             <span>Instagram ストーリーズ＆フィード</span>
-            <span class="size-tags">56px(リング) / 32px / 24px</span>
+            <span class="size-tags">56px(リング) / 32px / 28px / 24px</span>
           </div>
 
           <div class="ig-stories-bar">
@@ -957,20 +1140,7 @@
           </div>
 
           <div class="ig-comments">
-            <div class="ig-comment-row">
-              ${renderAvatarFrame(commentCand1, "size-28")}
-              <div>
-                <strong>${dHandle}</strong> ${renderCandidateBadge(commentCand1)}
-                <span>コメント欄の28pxアイコン表示です。細かすぎる文字や背景は潰れやすくなります。</span>
-              </div>
-            </div>
-            <div class="ig-comment-row" style="padding-left: 24px;">
-              ${renderAvatarFrame(commentCand2, "size-24")}
-              <div>
-                <strong>${dHandle}</strong> ${renderCandidateBadge(commentCand2)}
-                <span>返信コメントの極小24pxサイズでの見え方チェック！</span>
-              </div>
-            </div>
+            ${igCommentsHtml}
           </div>
         </article>
       `);
@@ -980,12 +1150,7 @@
     // 3. Discord Card
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "discord") {
-      const chatCandidates =
-        state.compareMode === "mix" && state.candidates.length > 0
-          ? state.candidates
-          : [activeCand];
-
-      const discordMsgsHtml = chatCandidates
+      const discordMsgsHtml = allOrActiveCandidates
         .map(
           (cand, i) => `
           <div class="discord-msg">
@@ -997,7 +1162,7 @@
               <div>
                 <span class="discord-username">${dName}</span>
                 ${renderCandidateBadge(cand)}
-                <span class="discord-timestamp">今日 12:0${i}</span>
+                <span class="discord-timestamp">今日 12:0${i % 10}</span>
               </div>
               <div class="discord-text">${
                 i === 0
@@ -1014,7 +1179,7 @@
         state.candidates.length > 0 ? state.candidates : [activeCand]
       )
         .map(
-          (cand) => `
+          (cand, i) => `
           <div class="discord-member-row">
             <div class="discord-avatar-wrap">
               ${renderAvatarFrame(cand, "size-32")}
@@ -1022,7 +1187,7 @@
             </div>
             <span class="discord-member-name">${
               state.compareMode === "mix" && cand
-                ? escapeHtml(cand.name)
+                ? `#${i + 1} ${escapeHtml(cand.name)}`
                 : dName
             }</span>
           </div>
@@ -1059,16 +1224,48 @@
     }
 
     // -----------------------------------------------------------------------
-    // 4. LINE Card
+    // 4. LINE Card (All candidates in Talk List & Chat Room!)
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "line") {
-      const talkCand1 = getCandidateForSlot(0);
-      const talkCand2 = getCandidateForSlot(1);
+      const talkListHtml = allOrActiveCandidates
+        .map(
+          (cand, i) => `
+          <div class="line-talk-item">
+            ${renderAvatarFrame(cand, "size-48")}
+            <div class="line-talk-info">
+              <div class="line-talk-top">
+                <span>${dName} ${renderCandidateBadge(cand)}</span>
+                <span class="line-talk-time">11:${59 - (i % 50)}</span>
+              </div>
+              <div class="line-talk-preview">
+                <span>${i === 0 ? dText : "トーク一覧の48px丸アイコンでの見え方比較です"}</span>
+                <span class="line-unread-badge">${(i % 3) + 1}</span>
+              </div>
+            </div>
+          </div>
+        `
+        )
+        .join("");
 
-      const chatRoomCandidates =
-        state.compareMode === "mix" && state.candidates.length > 0
-          ? state.candidates
-          : [activeCand];
+      const chatRoomHtml = allOrActiveCandidates
+        .map(
+          (cand, i) => `
+          <div class="line-msg-row">
+            ${renderAvatarFrame(cand, "size-36")}
+            <div>
+              <div class="line-sender-name">${dName} ${
+                state.compareMode === "mix" && cand
+                  ? `(#${i + 1} ${escapeHtml(cand.name)})`
+                  : ""
+              }</div>
+              <div class="line-bubble">
+                青みがかったトーク背景の上での36pxアイコンの視認性はどうですか？
+              </div>
+            </div>
+          </div>
+        `
+        )
+        .join("");
 
       cards.push(`
         <article class="sns-card">
@@ -1078,60 +1275,11 @@
           </div>
 
           <div class="line-talk-list">
-            <div class="line-talk-item">
-              ${renderAvatarFrame(talkCand1, "size-48")}
-              <div class="line-talk-info">
-                <div class="line-talk-top">
-                  <span>${dName} ${renderCandidateBadge(talkCand1)}</span>
-                  <span class="line-talk-time">11:55</span>
-                </div>
-                <div class="line-talk-preview">
-                  <span>${dText}</span>
-                  <span class="line-unread-badge">2</span>
-                </div>
-              </div>
-            </div>
-            ${
-              state.compareMode === "mix" && state.candidates.length > 1
-                ? `
-              <div class="line-talk-item">
-                ${renderAvatarFrame(talkCand2, "size-48")}
-                <div class="line-talk-info">
-                  <div class="line-talk-top">
-                    <span>${dName} ${renderCandidateBadge(talkCand2)}</span>
-                    <span class="line-talk-time">11:40</span>
-                  </div>
-                  <div class="line-talk-preview">
-                    <span>トーク一覧の48px丸アイコンでの並び比較です</span>
-                    <span class="line-unread-badge">1</span>
-                  </div>
-                </div>
-              </div>
-            `
-                : ""
-            }
+            ${talkListHtml}
           </div>
 
           <div class="line-chat-room">
-            ${chatRoomCandidates
-              .map(
-                (cand) => `
-              <div class="line-msg-row">
-                ${renderAvatarFrame(cand, "size-36")}
-                <div>
-                  <div class="line-sender-name">${dName} ${
-                    state.compareMode === "mix" && cand
-                      ? `(${escapeHtml(cand.name)})`
-                      : ""
-                  }</div>
-                  <div class="line-bubble">
-                    青みがかったトーク背景の上での36pxアイコンの視認性はどうですか？
-                  </div>
-                </div>
-              </div>
-            `
-              )
-              .join("")}
+            ${chatRoomHtml}
           </div>
         </article>
       `);
@@ -1141,11 +1289,7 @@
     // 5. YouTube Card
     // -----------------------------------------------------------------------
     if (state.platform === "all" || state.platform === "youtube") {
-      const chCand = getCandidateForSlot(0);
-      const commentCandidates =
-        state.compareMode === "mix" && state.candidates.length > 0
-          ? state.candidates
-          : [activeCand];
+      const chCand = activeCand;
 
       cards.push(`
         <article class="sns-card">
@@ -1166,17 +1310,17 @@
           </div>
 
           <div class="yt-comments-wrap">
-            ${commentCandidates
+            ${allOrActiveCandidates
               .map(
                 (cand, i) => `
               <div class="yt-comment-item">
-                ${renderAvatarFrame(cand, i === 0 ? "size-40" : "size-24")}
+                ${renderAvatarFrame(cand, i % 2 === 0 ? "size-40" : "size-24")}
                 <div>
                   <div>
                     <span class="yt-comment-author ${i === 0 ? "owner-pill" : ""}">@${dHandle}</span>
                     ${renderCandidateBadge(cand)}
                     <span style="font-size: 0.7rem; color: var(--sns-subtext); margin-left: 4px;">
-                      ${i === 0 ? "40px コメント" : "24px 返信コメント"}
+                      ${i % 2 === 0 ? "40px コメント" : "24px 返信コメント"}
                     </span>
                   </div>
                   <div class="yt-comment-text">${
@@ -1331,7 +1475,7 @@
       updateCropModalPreview();
       cropModal.classList.remove("hidden");
     };
-    img.src = cand.sourceUrl || cand.dataUrl;
+    img.src = cand.sourceUrl || cand.sourceDataUrl || cand.dataUrl;
   }
 
   function updateCropModalPreview() {
@@ -1354,7 +1498,6 @@
     const ctx = cropStageCanvas.getContext("2d");
     ctx.clearRect(0, 0, STAGE_SIZE, STAGE_SIZE);
 
-    // Subtle checkerboard/dark background
     ctx.fillStyle = "#090d16";
     ctx.fillRect(0, 0, STAGE_SIZE, STAGE_SIZE);
 
@@ -1371,7 +1514,7 @@
     const imgY = STAGE_SIZE / 2 - drawH / 2 + offsetY;
     ctx.drawImage(img, imgX, imgY, drawW, drawH);
 
-    // Draw semi-transparent dark mask OUTSIDE the circular crop area so user can see uncropped outer parts
+    // Draw semi-transparent dark mask OUTSIDE the circular crop area
     ctx.save();
     ctx.fillStyle = "rgba(9, 13, 22, 0.68)";
     ctx.beginPath();
@@ -1441,7 +1584,7 @@
         cand.panY
       );
       const diagnostics = analyzeCroppedCanvas(croppedCanvas);
-      const croppedObj = await canvasToOptimizedUrl(croppedCanvas);
+      const croppedObj = canvasToUrls(croppedCanvas);
       croppedCanvas.width = 1;
       croppedCanvas.height = 1;
 
@@ -1452,6 +1595,7 @@
       }
 
       cand.dataUrl = croppedObj.url;
+      cand.croppedDataUrl = croppedObj.dataUrl;
       cand.isCroppedObjectUrl = croppedObj.isObjectUrl;
       cand.diagnostics = diagnostics;
     }
@@ -1460,6 +1604,7 @@
     state.editingCandidateId = null;
     state.editingSourceImg = null;
     renderAll();
+    scheduleSaveState();
   }
 
   function exportCroppedPng() {
@@ -1535,7 +1680,6 @@
     isDraggingCrop = false;
   });
 
-  // Mouse wheel zoom on cropStage
   cropStage.addEventListener(
     "wheel",
     (e) => {
@@ -1549,7 +1693,6 @@
     { passive: false }
   );
 
-  // Preset buttons: "全体を入れる" (fit longest side inside circle) & "枠に合わせる(100%)"
   if (btnFitWhole) {
     btnFitWhole.addEventListener("click", () => {
       const cand = state.candidates.find((c) => c.id === state.editingCandidateId);
@@ -1557,8 +1700,7 @@
       if (!cand || !img) return;
       const sourceW = cand.sourceW || img.naturalWidth || 256;
       const sourceH = cand.sourceH || img.naturalHeight || 256;
-      const ratio =
-        Math.min(sourceW, sourceH) / Math.max(sourceW, sourceH);
+      const ratio = Math.min(sourceW, sourceH) / Math.max(sourceW, sourceH);
       const fitZoom = Math.max(40, Math.round(ratio * 100));
       sliderZoom.value = fitZoom;
       sliderPanX.value = 0;
@@ -1587,9 +1729,10 @@
     }
   });
 
-  fileInput.addEventListener("change", (e) => {
+  // IMPORTANT: Wait for handleFiles to finish BEFORE clearing fileInput.value!
+  fileInput.addEventListener("change", async (e) => {
     if (e.target.files?.length) {
-      handleFiles(e.target.files);
+      await handleFiles(e.target.files);
       fileInput.value = "";
     }
   });
@@ -1611,7 +1754,6 @@
     }
   });
 
-  // Paste from clipboard (Ctrl+V)
   window.addEventListener("paste", (e) => {
     const items = e.clipboardData?.items;
     if (!items) return;
@@ -1627,7 +1769,6 @@
     }
   });
 
-  // Mobile Toolbar Drawer Toggle
   if (btnToggleToolbarDrawer) {
     btnToggleToolbarDrawer.addEventListener("click", () => {
       state.isDrawerOpen = !state.isDrawerOpen;
@@ -1640,8 +1781,12 @@
     });
   }
 
-  // Candidate List & Quick Switcher Delegation
   document.addEventListener("click", (e) => {
+    if (e.target.closest("#btn-add-more-inline")) {
+      fileInput.click();
+      return;
+    }
+
     const cropBtn = e.target.closest("[data-crop-id]");
     if (cropBtn) {
       e.stopPropagation();
@@ -1660,6 +1805,7 @@
         state.activeId = state.candidates[0]?.id || null;
       }
       renderAll();
+      scheduleSaveState();
       return;
     }
 
@@ -1667,6 +1813,7 @@
     if (selectEl) {
       state.activeId = selectEl.getAttribute("data-select-id");
       renderAll();
+      scheduleSaveState();
       return;
     }
 
@@ -1674,10 +1821,10 @@
     if (avatarEl && !cropModal.contains(avatarEl)) {
       state.activeId = avatarEl.getAttribute("data-candidate-id");
       renderAll();
+      scheduleSaveState();
     }
   });
 
-  // Keyboard 1-9 to switch active candidate quickly
   window.addEventListener("keydown", (e) => {
     if (
       ["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName) ||
@@ -1690,6 +1837,7 @@
       if (state.candidates[idx]) {
         state.activeId = state.candidates[idx].id;
         renderAll();
+        scheduleSaveState();
       }
     }
   });
@@ -1698,20 +1846,24 @@
   btnClearAll.addEventListener("click", () => {
     clearAllCandidates();
     renderAll();
+    scheduleSaveState();
   });
 
   // Profile fields
   inputDisplayName.addEventListener("input", (e) => {
     state.profile.displayName = e.target.value;
     renderAll();
+    scheduleSaveState();
   });
   inputHandle.addEventListener("input", (e) => {
     state.profile.handle = e.target.value;
     renderAll();
+    scheduleSaveState();
   });
   inputPostText.addEventListener("input", (e) => {
     state.profile.postText = e.target.value;
     renderAll();
+    scheduleSaveState();
   });
 
   // Toolbar Tabs
@@ -1723,6 +1875,7 @@
       .querySelectorAll(".seg-btn")
       .forEach((b) => b.classList.toggle("active", b === btn));
     renderAll();
+    scheduleSaveState();
   });
 
   themeTabs.addEventListener("click", (e) => {
@@ -1733,6 +1886,7 @@
       .querySelectorAll(".seg-btn")
       .forEach((b) => b.classList.toggle("active", b === btn));
     renderAll();
+    scheduleSaveState();
   });
 
   platformTabs.addEventListener("click", (e) => {
@@ -1743,6 +1897,7 @@
       .querySelectorAll(".pill-btn")
       .forEach((b) => b.classList.toggle("active", b === btn));
     renderAll();
+    scheduleSaveState();
   });
 
   // Filters
@@ -1778,7 +1933,12 @@
   btnExportCropped.addEventListener("click", exportCroppedPng);
 
   // =========================================================================
-  // Initialize
+  // Initialize: Restore from IndexedDB if available; otherwise load samples
   // =========================================================================
-  loadSamples();
+  (async function init() {
+    const restored = await loadStateFromStorage();
+    if (!restored) {
+      await loadSamples();
+    }
+  })();
 })();
